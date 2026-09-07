@@ -3,7 +3,7 @@
 # must be on the same network
 # requires:
 # pv (brew install pv)
-# nc (netcat-openbsd)
+# nc (Apple, OpenBSD, GNU, traditional netcat, or Ncat)
 # ssh (openssh)
 # sha256sum (brew install coreutils)
 
@@ -75,18 +75,53 @@ if [ -z "$FILE" ] || [ -z "$DEST_IP" ] || [ -z "$DEST_PORT" ] || [ -z "$DEST_SSH
     help
 fi
 
-# Detect local nc capabilities 
+# Options with the same name can mean different things across nc variants.
+# Set sender and listener options together, using the help from each host.
+detect_nc() {
+    local nc_help="$1"
+    NC_SEND=()
+    NC_LISTEN=""
+    NC_VARIANT=""
+    case "$nc_help" in
+        *--apple-*|*'tcp adaptive write timeout'*)
+            NC_VARIANT="Apple netcat"
+            # Apple nc has no EOF shutdown flag. Bound the final read wait.
+            NC_SEND=(-w 3)
+            NC_LISTEN="-l"
+            ;;
+        *'GNU netcat'*)
+            NC_VARIANT="GNU netcat"
+            NC_SEND=(-c)
+            NC_LISTEN="-l -p"
+            ;;
+        *Ncat*)
+            NC_VARIANT="Ncat"
+            NC_SEND=(--send-only)
+            NC_LISTEN="-l"
+            ;;
+        *)
+            if printf '%s\n' "$nc_help" | grep -Eiq -- '^[[:space:]]*-N[[:space:]]+.*shutdown'; then
+                NC_VARIANT="OpenBSD netcat"
+                NC_SEND=(-N)
+                NC_LISTEN="-l"
+            elif printf '%s\n' "$nc_help" | grep -Eq -- '^[[:space:]]*-q[[:space:]]'; then
+                NC_VARIANT="netcat with EOF quit support"
+                NC_SEND=(-q 0)
+                NC_LISTEN="-l -p"
+            else
+                return 1
+            fi
+            ;;
+    esac
+}
+
 vprint "nc_wire: Detecting local nc capabilities..."
-NC_SRC_OPTIONS="-q 0"
-if nc -h 2>&1 | grep -q "\-N"; then
-    vprint "nc_wire: Auto-detected local nc supports -N (OpenBSD style)"
-    NC_SRC_OPTIONS="-N"
-elif nc -h 2>&1 | grep -q "\-q"; then
-    vprint "nc_wire: Auto-detected local nc supports -q (Traditional style)"
-else
-    vprint "nc_wire: Warning: Could not detect optimal local nc options, using defaults but might fail to close."
+LOCAL_NC_HELP=$(nc -h 2>&1)
+if ! detect_nc "$LOCAL_NC_HELP"; then
+    error_exit "nc_wire: Unsupported local nc implementation. Check nc -h."
 fi
-vprint "nc_wire: Local nc options: $NC_SRC_OPTIONS"
+NC_SRC_OPTIONS=("${NC_SEND[@]}")
+vprint "nc_wire: Local $NC_VARIANT options: ${NC_SRC_OPTIONS[*]}"
 
 # Pre-flight checks
 vprint "nc_wire: Checking SSH connection to $DEST_SSH..."
@@ -97,17 +132,12 @@ if ! ssh "$DEST_SSH" "test -d \"$DEST_FOLDER\" && test -w \"$DEST_FOLDER\""; the
 
 # Detect remote nc capabilities
 vprint "nc_wire: Probing remote nc capabilities..."
-NC_DEST_OPTIONS="-l -p"
 REMOTE_NC_HELP=$(ssh "$DEST_SSH" "nc -h 2>&1")
-if echo "$REMOTE_NC_HELP" | grep -q "\-N"; then
-    vprint "nc_wire: Auto-detected remote nc supports -N (OpenBSD style)"
-    NC_DEST_OPTIONS="-l"
-elif echo "$REMOTE_NC_HELP" | grep -q "\-q"; then
-    vprint "nc_wire: Auto-detected remote nc supports -q (Traditional style)"
-else
-    vprint "nc_wire: Warning: Could not detect optimal remote nc options."
+if ! detect_nc "$REMOTE_NC_HELP"; then
+    error_exit "nc_wire: Unsupported remote nc implementation on $DEST_SSH. Check nc -h there."
 fi
-vprint "nc_wire: Remote nc options: $NC_DEST_OPTIONS"
+NC_DEST_OPTIONS=$NC_LISTEN
+vprint "nc_wire: Remote $NC_VARIANT options: $NC_DEST_OPTIONS"
 
 # OUT_FILE is just the file name
 OUT_FILE=$(basename "$FILE")
@@ -131,7 +161,7 @@ vprint "nc_wire: Starting receiver on $DEST_SSH (will wait 3 seconds before star
 ssh $DEST_SSH "nc $NC_DEST_OPTIONS $DEST_PORT > \"$DEST_FOLDER\"/\"$OUT_FILE\"" &
 sleep 3
 vprint "nc_wire: Starting sender"
-pv "$IN_FILE" | nc $NC_SRC_OPTIONS $DEST_IP $DEST_PORT
+pv "$IN_FILE" | nc "${NC_SRC_OPTIONS[@]}" "$DEST_IP" "$DEST_PORT"
 
 if [ "$DO_SHA" = true ]; then
     vprint "nc_wire: Computing sha256sum of \"$DEST_FOLDER\"/\"$OUT_FILE\""

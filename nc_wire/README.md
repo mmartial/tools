@@ -9,6 +9,9 @@ Ensure the following tools are installed on both the source and destination syst
 
 -   `pv` (Pipe Viewer) - Used for monitoring the progress of data through a pipe.
 -   `nc` (Netcat) - The networking utility for reading from and writing to network connections.
+    - Supports Apple/macOS, OpenBSD, GNU (Homebrew), traditional netcat, and Ncat; each host is detected independently.
+    - Apple netcat uses `-w 3` to bound its final read wait because it has no EOF shutdown option. Other supported variants use their EOF shutdown option.
+    - Unrecognized implementations stop the transfer with an error instead of guessing flags.
     - the port used for communication should be open on the remote server.
 -   `ssh` (OpenSSH) - For secure remote login and command execution.
     - pre-established access to the remote server and an ssh-agent with the private key, to avoid the need for ssh handhsake and password prompts.
