@@ -1,5 +1,8 @@
 #!/bin/bash
 
+# Preserve failures from pv and checksum commands in pipelines.
+set -o pipefail
+
 # must be on the same network
 # requires:
 # pv (brew install pv)
@@ -14,66 +17,72 @@ is_installed() { if ! command -v "$1" >/dev/null 2>&1; then error_exit "$1 is no
 
 vprint() { if [ "$VERBOSE" = true ]; then echo "$1"; fi; }
 
-# Pre-flight checks
+# Quote a value for the remote POSIX shell, including embedded apostrophes.
+shell_quote() { local value=${1//\'/\'\\\'\'}; printf "'%s'" "$value"; }
+
+help() {
+    echo "Usage: $0 [-v] [-a] [-p <port>] -i <ip> -s <ssh> -d <folder> [--] <file> [file ...]"
+    echo "Copies files sequentially to one remote folder using SSH and netcat."
+    echo "  -i <ip>     Destination IP for the data connection"
+    echo "  -s <ssh>    SSH destination (user@host or SSH config alias)"
+    echo "  -d <folder> Existing writable destination folder"
+    echo "  -p <port>   Optional fixed destination port (default: random)"
+    echo "  -a          Verify SHA256 for each file"
+    echo "  -v          Verbose output, including selected ports"
+    echo "  -h          Show help"
+    echo "By default, a random free remote port in 49152-65535 is selected for each file."
+    echo "Example: $0 -i 10.0.0.13 -s motoko -d /4TB -a ~/Downloads/*.safetensors"
+}
+
+DO_SHA=false
+VERBOSE=false
+FIXED_PORT=""
+FILES=()
+while [ "$#" -gt 0 ]; do
+    case "$1" in
+        -i|-s|-d|-p)
+            [ "$#" -ge 2 ] || error_exit "nc_wire: Missing value for $1."
+            case "$1" in
+                -i) DEST_IP=$2 ;;
+                -s) DEST_SSH=$2 ;;
+                -d) DEST_FOLDER=$2 ;;
+                -p)
+                    case "$2" in ''|*[!0-9]*) error_exit "nc_wire: Port must be an integer from 1 to 65535." ;; esac
+                    [ "${#2}" -le 5 ] || error_exit "nc_wire: Port must be an integer from 1 to 65535."
+                    FIXED_PORT=$((10#$2))
+                    [ "$FIXED_PORT" -ge 1 ] && [ "$FIXED_PORT" -le 65535 ] || error_exit "nc_wire: Port must be an integer from 1 to 65535."
+                    ;;
+            esac
+            shift 2 ;;
+        -a) DO_SHA=true; shift ;;
+        -v) VERBOSE=true; shift ;;
+        -h|--help) help; exit 0 ;;
+        --) shift; FILES+=("$@"); break ;;
+        -*) error_exit "nc_wire: Unknown option $1. Use -h for usage; files are positional." ;;
+        *) FILES+=("$1"); shift ;;
+    esac
+done
+if [ "${#FILES[@]}" -eq 0 ] || [ -z "$DEST_IP" ] || [ -z "$DEST_SSH" ] || [ -z "$DEST_FOLDER" ]; then
+    help
+    exit 1
+fi
+
 is_installed pv
 is_installed nc
 is_installed ssh
-is_installed sha256sum
+if [ "$DO_SHA" = true ]; then is_installed sha256sum; fi
 
-# Help function
-help() {
-    echo "Copies a file to a remote server using netcat (wire transfer) for speed. The script uses ssh for authentication and shell access to the destination."
-    echo ""
-    echo "Usage: $0 [-v] -f <file> -i <ip> -p <port> -s <ssh> -d <folder> [-a]"
-    echo "  -v : verbose mode"
-    echo "  -f <file> : input file"
-    echo "  -i <ip> : destination ip (recommended to be on the same network as the sender)"
-    echo "  -p <port> : destination port (firewall for the port must be open on the destination)"
-    echo "  -s <ssh> : destination ssh (user@ip, short name for ssh config, ...)"
-    echo "  -d <folder> : destination folder (must exist on the destination and be accessible/writeable by the ssh user)"
-    echo "  -a : perform sha256sum comparison (optional, default: false)"
-    echo ""
-    echo "Example: $0 -f /path/to/file -i 192.168.1.1 -p 2020 -s user@192.168.1.1 -d /path/to/destination/folder"
-    echo "  will create /path/to/destination/folder/file on the destination"
-    exit 1
-}
-
-# Arguments processing
-DO_SHA=false
-VERBOSE=false
-while getopts ":f:i:p:s:d:av" opt; do
-    case $opt in
-        f)
-            FILE=$OPTARG
-            ;;
-        i)
-            DEST_IP=$OPTARG
-            ;;
-        p)
-            DEST_PORT=$OPTARG
-            ;;
-        s)
-            DEST_SSH=$OPTARG
-            ;;
-        d)
-            DEST_FOLDER=$OPTARG
-            ;;
-        a)
-            DO_SHA=true
-            ;;
-        v)
-            VERBOSE=true
-            ;;
-        \?)
-            help
-            ;;
-    esac
+# Validate every input before starting any transfer. Duplicate basenames would
+# overwrite each other in the shared destination folder.
+NAMES=()
+for FILE in "${FILES[@]}"; do
+    [ -f "$FILE" ] && [ -r "$FILE" ] || error_exit "nc_wire: Not a readable file: $FILE"
+    NAME=${FILE##*/}
+    for PREVIOUS in "${NAMES[@]}"; do
+        [ "$NAME" != "$PREVIOUS" ] || error_exit "nc_wire: Duplicate destination filename: $NAME"
+    done
+    NAMES+=("$NAME")
 done
-
-# Variables to configure
-if [ -z "$FILE" ] || [ -z "$DEST_IP" ] || [ -z "$DEST_PORT" ] || [ -z "$DEST_SSH" ] || [ -z "$DEST_FOLDER" ]; then
-    help
-fi
 
 # Options with the same name can mean different things across nc variants.
 # Set sender and listener options together, using the help from each host.
@@ -121,14 +130,48 @@ if ! detect_nc "$LOCAL_NC_HELP"; then
     error_exit "nc_wire: Unsupported local nc implementation. Check nc -h."
 fi
 NC_SRC_OPTIONS=("${NC_SEND[@]}")
-vprint "nc_wire: Local $NC_VARIANT options: ${NC_SRC_OPTIONS[*]}"
+# GNU -c can reset the socket while data is still queued. Apple nc only
+# offers a timeout. Use an explicit TCP half-close for these senders.
+USE_PYTHON_SENDER=false
+case "$NC_VARIANT" in
+    "GNU netcat"|"Apple netcat")
+        is_installed python3
+        USE_PYTHON_SENDER=true ;;
+esac
+vprint "nc_wire: Local $NC_VARIANT; Python TCP sender: $USE_PYTHON_SENDER"
+
+send_file() {
+    if [ "$USE_PYTHON_SENDER" = true ]; then
+        python3 -c '
+import socket
+import sys
+try:
+    with socket.create_connection((sys.argv[1], int(sys.argv[2])), timeout=30) as sock:
+        sock.settimeout(None)
+        while True:
+            data = sys.stdin.buffer.read(1024 * 1024)
+            if not data:
+                break
+            sock.sendall(data)
+        sock.shutdown(socket.SHUT_WR)
+        while sock.recv(65536):
+            pass
+except (OSError, ValueError) as exc:
+    print("nc_wire: TCP sender failed: " + str(exc), file=sys.stderr)
+    sys.exit(1)
+' "$DEST_IP" "$DEST_PORT"
+    else
+        nc "${NC_SRC_OPTIONS[@]}" "$DEST_IP" "$DEST_PORT"
+    fi
+}
 
 # Pre-flight checks
 vprint "nc_wire: Checking SSH connection to $DEST_SSH..."
 if ! ssh -q "$DEST_SSH" exit; then error_exit "nc_wire: Error: Cannot connect to $DEST_SSH"; fi
 
 vprint "nc_wire: Checking destination folder on remote..."
-if ! ssh "$DEST_SSH" "test -d \"$DEST_FOLDER\" && test -w \"$DEST_FOLDER\""; then error_exit "nc_wire: Error: Destination folder \"$DEST_FOLDER\" does not exist or is not writable on $DEST_SSH"; fi
+REMOTE_FOLDER=$(shell_quote "$DEST_FOLDER")
+if ! ssh -n "$DEST_SSH" "test -d $REMOTE_FOLDER && test -w $REMOTE_FOLDER"; then error_exit "nc_wire: Error: Destination folder \"$DEST_FOLDER\" does not exist or is not writable on $DEST_SSH"; fi
 
 # Detect remote nc capabilities
 vprint "nc_wire: Probing remote nc capabilities..."
@@ -139,36 +182,105 @@ fi
 NC_DEST_OPTIONS=$NC_LISTEN
 vprint "nc_wire: Remote $NC_VARIANT options: $NC_DEST_OPTIONS"
 
-# OUT_FILE is just the file name
-OUT_FILE=$(basename "$FILE")
-# IN_FILE is the full path
-IN_FILE=$(readlink -f "$FILE")
-# Clean up trailing slash
-DEST_FOLDER=${DEST_FOLDER%/}
+# Selection happens on the SSH host; no probe connection is made to nc,
+# since that would consume its one allowed connection.
+select_remote_port() {
+    ssh -n "$DEST_SSH" "requested_port='$FIXED_PORT';"' # nc_wire: select free port
+        if command -v ss >/dev/null 2>&1; then
+            checker=ss
+        elif command -v lsof >/dev/null 2>&1; then
+            checker=lsof
+        else
+            echo "nc_wire: Install ss or lsof on the destination." >&2
+            exit 1
+        fi
+        attempt=0
+        while [ "$attempt" -lt 100 ]; do
+            attempt=$((attempt + 1))
+            if [ -n "$requested_port" ]; then
+                port=$requested_port
+            else
+                random=$(od -An -N2 -tu2 /dev/urandom) || exit 1
+                port=$((49152 + random % 16384))
+            fi
+            if [ "$checker" = ss ]; then
+                listeners=$(ss -H -ltn "sport = :$port") || exit 1
+            else
+                listeners=$(lsof -nP -iTCP:$port -sTCP:LISTEN 2>/dev/null)
+                status=$?
+                [ "$status" -le 1 ] || exit 1
+            fi
+            if [ -z "$listeners" ]; then
+                echo "$port"
+                exit 0
+            fi
+            if [ -n "$requested_port" ]; then
+                echo "nc_wire: Requested port $requested_port is occupied." >&2
+                exit 1
+            fi
+        done
+        echo "nc_wire: No free random port found after 100 attempts." >&2
+        exit 1
+    '
+}
 
-# Check if file exists
-if [ ! -f "$IN_FILE" ]; then error_exit "File $IN_FILE does not exist."; fi
+RECEIVER_PID=""
+cleanup_receiver() {
+    if [ -n "$RECEIVER_PID" ]; then
+        kill "$RECEIVER_PID" 2>/dev/null || true
+        wait "$RECEIVER_PID" 2>/dev/null || true
+    fi
+}
+trap cleanup_receiver EXIT
+trap 'exit 130' INT
+trap 'exit 143' TERM
 
-# if SHA256 is set, we will compute the sha256sum of the file and compare it with the one on the destination
-if [ "$DO_SHA" = true ]; then
-    vprint "nc_wire: Computing sha256sum of \"$IN_FILE\""
-    SRC_SHA256=$(sha256sum "$IN_FILE" | awk '{print $1}')
-    vprint "nc_wire: SHA256: \"$SRC_SHA256\""
-fi
+for FILE in "${FILES[@]}"; do
+    # Prefix relative paths so files beginning with '-' are passed as filenames.
+    case "$FILE" in /*) IN_FILE=$FILE ;; *) IN_FILE="$PWD/$FILE" ;; esac
+    OUT_FILE=${FILE##*/}
+    REMOTE_FILE=$(shell_quote "${DEST_FOLDER%/}/$OUT_FILE")
+    SRC_SIZE=$(wc -c < "$IN_FILE") || error_exit "nc_wire: Cannot read source size."
+    if [ "$DO_SHA" = true ]; then
+        SRC_SHA256=$(sha256sum "$IN_FILE" | awk '{print $1}') || error_exit "nc_wire: Cannot checksum source file."
+    fi
+    DEST_PORT=$(select_remote_port) || error_exit "nc_wire: Cannot select a free destination port."
+    case "$DEST_PORT" in ''|*[!0-9]*) error_exit "nc_wire: Invalid port returned by remote host." ;; esac
+    [ "${#DEST_PORT}" -le 5 ] && [ "$DEST_PORT" -ge 1 ] && [ "$DEST_PORT" -le 65535 ] || error_exit "nc_wire: Invalid port returned by remote host."
+    vprint "nc_wire: Transferring $IN_FILE to $DEST_SSH:$DEST_FOLDER/$OUT_FILE on port $DEST_PORT"
 
-vprint "nc_wire: Transferring \"$IN_FILE\" to $DEST_SSH:\"$DEST_FOLDER\"/\"$OUT_FILE\""
-vprint "nc_wire: Starting receiver on $DEST_SSH (will wait 3 seconds before starting sender)"
-ssh $DEST_SSH "nc $NC_DEST_OPTIONS $DEST_PORT > \"$DEST_FOLDER\"/\"$OUT_FILE\"" &
-sleep 3
-vprint "nc_wire: Starting sender"
-pv "$IN_FILE" | nc "${NC_SRC_OPTIONS[@]}" "$DEST_IP" "$DEST_PORT"
+    vprint "nc_wire: Starting receiver on $DEST_SSH (will wait 3 seconds before starting sender)"
+    ssh -n "$DEST_SSH" "nc $NC_DEST_OPTIONS $DEST_PORT > $REMOTE_FILE" &
+    RECEIVER_PID=$!
+    sleep 3
+    vprint "nc_wire: Starting sender"
+    if ! pv "$IN_FILE" | send_file; then
+        error_exit "nc_wire: Sender failed; destination file may be incomplete."
+    fi
 
-if [ "$DO_SHA" = true ]; then
-    vprint "nc_wire: Computing sha256sum of \"$DEST_FOLDER\"/\"$OUT_FILE\""
-    DEST_SHA256=$(ssh $DEST_SSH "sha256sum \"$DEST_FOLDER\"/\"$OUT_FILE\"" | awk '{print $1}')
-    vprint "nc_wire: DEST_SHA256: \"$DEST_SHA256\""
-    if [ "$SRC_SHA256" != "$DEST_SHA256" ]; then error_exit "nc_wire: SHA256 mismatch: \"$SRC_SHA256\" != \"$DEST_SHA256\""; fi
-    vprint "nc_wire: SHA256 match: \"$SRC_SHA256\""
-fi
+    # Sender EOF only means the bytes were handed to the network. The receiver
+    # must finish writing and close the file before we report success or hash it.
+    vprint "nc_wire: Waiting for receiver to finish writing..."
+    wait "$RECEIVER_PID"
+    RECEIVER_STATUS=$?
+    RECEIVER_PID=""
+    if [ "$RECEIVER_STATUS" -ne 0 ]; then
+        error_exit "nc_wire: Receiver failed (status $RECEIVER_STATUS); destination file may be incomplete."
+    fi
+
+    DEST_SIZE=$(ssh -n "$DEST_SSH" "wc -c < $REMOTE_FILE") || error_exit "nc_wire: Cannot read destination size."
+    if [ "$SRC_SIZE" -ne "$DEST_SIZE" ]; then
+        error_exit "nc_wire: Size mismatch: source $SRC_SIZE bytes; destination $DEST_SIZE bytes."
+    fi
+
+    if [ "$DO_SHA" = true ]; then
+        vprint "nc_wire: Computing sha256sum of \"$DEST_FOLDER\"/\"$OUT_FILE\""
+        DEST_SHA256=$(ssh "$DEST_SSH" "sha256sum $REMOTE_FILE" | awk '{print $1}') || error_exit "nc_wire: Cannot checksum destination file."
+        vprint "nc_wire: DEST_SHA256: \"$DEST_SHA256\""
+        if [ "$SRC_SHA256" != "$DEST_SHA256" ]; then error_exit "nc_wire: SHA256 mismatch: \"$SRC_SHA256\" != \"$DEST_SHA256\""; fi
+        vprint "nc_wire: SHA256 match: \"$SRC_SHA256\""
+    fi
+
+done
 
 exit 0

@@ -1,41 +1,35 @@
 # nc_wire
 
-`nc_wire` is a script that facilitates fast file transfers between computers using `netcat` (nc) and `ssh`. 
-It leverages `ssh` for authentication and secure control channel establishment, while using `netcat` for the high-speed data transfer.
+Copy one or more files sequentially to a remote folder using SSH for control and netcat for data transfer.
 
 ## Prerequisites
 
-Ensure the following tools are installed on both the source and destination systems (where applicable):
+- Local: `pv`, `nc`, and `ssh`; also `python3` for GNU or Apple netcat senders.
+- Remote: `nc`, `od`, and either `ss` or `lsof` to find free ports.
+- Both hosts: `sha256sum` when using `-a`.
+- SSH access to the destination and an existing writable destination folder.
+- TCP ports 49152–65535 on the destination must be reachable from the sender by default, or allow the specific port supplied with `-p`.
 
--   `pv` (Pipe Viewer) - Used for monitoring the progress of data through a pipe.
--   `nc` (Netcat) - The networking utility for reading from and writing to network connections.
-    - Supports Apple/macOS, OpenBSD, GNU (Homebrew), traditional netcat, and Ncat; each host is detected independently.
-    - Apple netcat uses `-w 3` to bound its final read wait because it has no EOF shutdown option. Other supported variants use their EOF shutdown option.
-    - Unrecognized implementations stop the transfer with an error instead of guessing flags.
-    - the port used for communication should be open on the remote server.
--   `ssh` (OpenSSH) - For secure remote login and command execution.
-    - pre-established access to the remote server and an ssh-agent with the private key, to avoid the need for ssh handhsake and password prompts.
--   `sha256sum` (Coreutils) - For computing and verifying SHA256 file checksums (optional but recommended).
+Apple/macOS, OpenBSD, GNU (Homebrew), traditional netcat, and Ncat are detected independently on each host. For GNU and Apple netcat, a Python TCP sender flushes all bytes and half-closes the connection before waiting for the receiver. This avoids GNU `-c` resetting a connection with queued data and Apple’s timeout-based EOF handling. Remote reception still uses netcat.
 
 ## Usage
 
-For a complete list of available options and flags, run the script without any arguments:
-
 ```bash
-./nc_wire.sh
+nc_wire [-v] [-a] [-p <port>] -i <ip> -s <ssh> -d <folder> [--] <file> [file ...]
 ```
 
-### Example
-
-Transfer a file to a remote server:
-
 ```bash
-./nc_wire.sh -f /path/to/my_large_file.safetensors -i 192.168.1.50 -p 9000 -s user@192.168.1.50 -d /home/user/models -a
+nc_wire -i 10.0.0.13 -s motoko \
+  -d "/4TB/StabilityMatrix/Data/Models/DiffusionModels/Flux.1 D/" \
+  -a ~/Downloads/reiq*.safetensors "$HOME/Downloads/another model.safetensors"
 ```
 
-The command will:
--   Transfer `/path/to/my_large_file.safetensors`.
--   Send it to the IP `192.168.1.50` on port `9000`.
--   Use `user@192.168.1.50` for SSH authentication.
--   Save the file in `/home/user/models` on the remote machine.
--   (`-a`) Verify the integrity of the transferred file using SHA256 checksums.
+Use actual paths for quoted filenames; tilde expansion works only when the tilde is unquoted. For example, `"$HOME/Downloads/my model.safetensors"`.
+
+`-f` has been removed. Supply files directly, including shell globs. Use `--` before filenames starting with a dash. All files go to the same folder under their original basenames; duplicate basenames are rejected before transfer. Existing destination files are overwritten.
+
+By default, for each file, the command uses SSH to select a fresh random port in 49152–65535, skipping existing listeners and retrying up to 100 candidates. Selection is randomized on every invocation. The check reduces collisions but does not reserve the port between selection and starting netcat.
+
+Files transfer sequentially. The command waits for the receiver to finish writing, checks byte counts, and, with `-a`, verifies each file's SHA256 before proceeding. Any transfer or checksum failure stops the command. Use `-v` to see the selected ports, or `-h` for help.
+
+To use a firewall-approved port, add `-p 16432`. Valid ports are 1–65535. The same port is reused sequentially for all files and checked before each transfer. If occupied, the command fails instead of choosing another port.
