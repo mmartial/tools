@@ -21,19 +21,21 @@ vprint() { if [ "$VERBOSE" = true ]; then echo "$1"; fi; }
 shell_quote() { local value=${1//\'/\'\\\'\'}; printf "'%s'" "$value"; }
 
 help() {
-    echo "Usage: $0 [-v] [-a] [-p <port>] -i <ip> -s <ssh> -d <folder> [--] <file> [file ...]"
+    echo "Usage: $0 [-v] [-a] [-f] [-p <port>] -i <ip> -s <ssh> -d <folder> [--] <file> [file ...]"
     echo "Copies files sequentially to one remote folder using SSH and netcat."
     echo "  -i <ip>     Destination IP for the data connection"
     echo "  -s <ssh>    SSH destination (user@host or SSH config alias)"
     echo "  -d <folder> Existing writable destination folder"
     echo "  -p <port>   Optional fixed destination port (default: random)"
-    echo "  -a          Verify SHA256 for each file"
+    echo "  -a          Verify SHA256 after each copy"
+    echo "  -f          Force overwrite of differing files; identical files are skipped"
     echo "  -v          Verbose output, including selected ports"
     echo "  -h          Show help"
     echo "By default, a random free remote port in 49152-65535 is selected for each file."
     echo "Example: $0 -i 10.0.0.13 -s motoko -d /4TB -a ~/Downloads/*.safetensors"
 }
 
+FORCE=false
 DO_SHA=false
 VERBOSE=false
 FIXED_PORT=""
@@ -54,6 +56,7 @@ while [ "$#" -gt 0 ]; do
                     ;;
             esac
             shift 2 ;;
+        -f) FORCE=true; shift ;;
         -a) DO_SHA=true; shift ;;
         -v) VERBOSE=true; shift ;;
         -h|--help) help; exit 0 ;;
@@ -70,7 +73,7 @@ fi
 is_installed pv
 is_installed nc
 is_installed ssh
-if [ "$DO_SHA" = true ]; then is_installed sha256sum; fi
+is_installed sha256sum
 
 # Validate every input before starting any transfer. Duplicate basenames would
 # overwrite each other in the shared destination folder.
@@ -235,13 +238,36 @@ trap cleanup_receiver EXIT
 trap 'exit 130' INT
 trap 'exit 143' TERM
 
+TRANSFER_STATUS=0
 for FILE in "${FILES[@]}"; do
     # Prefix relative paths so files beginning with '-' are passed as filenames.
     case "$FILE" in /*) IN_FILE=$FILE ;; *) IN_FILE="$PWD/$FILE" ;; esac
     OUT_FILE=${FILE##*/}
     REMOTE_FILE=$(shell_quote "${DEST_FOLDER%/}/$OUT_FILE")
+    SRC_SHA256=""
+    ALLOW_OVERWRITE=false
+    DEST_STATE=$(ssh -n "$DEST_SSH" "if test -L $REMOTE_FILE; then echo other; elif test -f $REMOTE_FILE; then echo file; elif test -e $REMOTE_FILE; then echo other; else echo missing; fi") || error_exit "nc_wire: Cannot inspect destination file."
+    case "$DEST_STATE" in
+        file)
+            SRC_SHA256=$(sha256sum "$IN_FILE" | awk '{print $1}') || error_exit "nc_wire: Cannot checksum source file."
+            DEST_SHA256=$(ssh -n "$DEST_SSH" "sha256sum $REMOTE_FILE" | awk '{print $1}') || error_exit "nc_wire: Cannot checksum destination file."
+            if [ "$SRC_SHA256" = "$DEST_SHA256" ]; then
+                echo "nc_wire: Skipping $OUT_FILE (SHA256 matches)."
+                continue
+            fi
+            if [ "$FORCE" != true ]; then
+                echo "nc_wire: Refusing to overwrite $OUT_FILE (SHA256 differs). Use -f to overwrite."
+                TRANSFER_STATUS=1
+                continue
+            fi
+            ALLOW_OVERWRITE=true
+            ;;
+        missing) ;;
+        other) error_exit "nc_wire: Destination is not a regular file: $OUT_FILE" ;;
+        *) error_exit "nc_wire: Invalid destination file status." ;;
+    esac
     SRC_SIZE=$(wc -c < "$IN_FILE") || error_exit "nc_wire: Cannot read source size."
-    if [ "$DO_SHA" = true ]; then
+    if [ "$DO_SHA" = true ] && [ -z "$SRC_SHA256" ]; then
         SRC_SHA256=$(sha256sum "$IN_FILE" | awk '{print $1}') || error_exit "nc_wire: Cannot checksum source file."
     fi
     DEST_PORT=$(select_remote_port) || error_exit "nc_wire: Cannot select a free destination port."
@@ -250,7 +276,10 @@ for FILE in "${FILES[@]}"; do
     vprint "nc_wire: Transferring $IN_FILE to $DEST_SSH:$DEST_FOLDER/$OUT_FILE on port $DEST_PORT"
 
     vprint "nc_wire: Starting receiver on $DEST_SSH (will wait 3 seconds before starting sender)"
-    ssh -n "$DEST_SSH" "nc $NC_DEST_OPTIONS $DEST_PORT > $REMOTE_FILE" &
+    # Do not clobber a file created since the initial absence check.
+    REMOTE_GUARD="set -C;"
+    if [ "$ALLOW_OVERWRITE" = true ]; then REMOTE_GUARD=""; fi
+    ssh -n "$DEST_SSH" "$REMOTE_GUARD nc $NC_DEST_OPTIONS $DEST_PORT > $REMOTE_FILE" &
     RECEIVER_PID=$!
     sleep 3
     vprint "nc_wire: Starting sender"
@@ -283,4 +312,4 @@ for FILE in "${FILES[@]}"; do
 
 done
 
-exit 0
+exit "$TRANSFER_STATUS"

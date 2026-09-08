@@ -9,7 +9,7 @@ SCRIPT = Path(__file__).resolve().parents[1] / 'nc_wire.sh'
 
 
 class TransferTests(unittest.TestCase):
-    def run_transfer(self, failure='', count=1, port=None):
+    def run_transfer(self, failure='', count=1, port=None, existing=None, force=False, verify=True):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             sources = [root / ("source ' $special " + str(i)) for i in range(count)]
@@ -17,6 +17,9 @@ class TransferTests(unittest.TestCase):
                 source.write_bytes(bytes(range(256)) * (4096 + i))
             destination = root / "destination ' with spaces"
             destination.mkdir()
+            if existing:
+                for source in sources:
+                    (destination / source.name).write_bytes(source.read_bytes() if existing == 'same' else b'old content')
             binaries = root / 'bin'
             binaries.mkdir()
             mocks = {
@@ -55,15 +58,26 @@ sh -c "$1"''',
                 path.chmod(0o755)
             result = subprocess.run(
                 ['bash', str(SCRIPT), '-i', 'localhost', '-s', 'mock',
-                 '-d', str(destination), '-a', *(['-p', str(port)] if port is not None else []), *map(str, sources)],
+                 '-d', str(destination), *(['-a'] if verify else []), *(['-f'] if force else []), *(['-p', str(port)] if port is not None else []), *map(str, sources)],
                 env=dict(os.environ, PATH=str(binaries) + ':' + os.environ['PATH'],
                          TEST_ROOT=str(root), FAILURE=failure),
                 capture_output=True, text=True, timeout=15,
             )
+            if existing == 'different' and not force:
+                self.assertNotEqual(result.returncode, 0)
+                self.assertIn('Refusing to overwrite', result.stdout)
+                for source in sources:
+                    self.assertEqual((destination / source.name).read_bytes(), b'old content')
+                self.assertFalse((root / 'ports').exists())
+                return result.stdout
             if failure in ('', 'retry'):
                 self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
                 for source in sources:
                     self.assertEqual(source.read_bytes(), (destination / source.name).read_bytes())
+                if existing == 'same':
+                    self.assertFalse((root / 'ports').exists())
+                    self.assertEqual(result.stdout.count('SHA256 matches'), count)
+                    return result.stdout
                 ports = (root / 'ports').read_text().splitlines()
                 self.assertEqual(len(ports), count + (failure == 'retry'))
                 for line in ports:
@@ -104,11 +118,16 @@ sh -c "$1"''',
             self.assertNotEqual(result.returncode, 0)
             self.assertIn('Port must be', result.stdout)
 
-    def test_removed_options_rejected(self):
-        for option in ['-f']:
-            result = subprocess.run(['bash', str(SCRIPT), option, 'foo'], capture_output=True, text=True)
-            self.assertNotEqual(result.returncode, 0)
-            self.assertIn('Unknown option', result.stdout)
+    def test_identical_files_skipped_even_with_force(self):
+        for force in (False, True):
+            self.run_transfer(count=2, existing='same', force=force, verify=False)
+
+    def test_different_files_refused_without_force(self):
+        self.run_transfer(count=2, existing='different', verify=False)
+
+    def test_force_overwrites_different_files(self):
+        self.run_transfer(count=2, existing='different', force=True)
+
 
 
 if __name__ == '__main__':
