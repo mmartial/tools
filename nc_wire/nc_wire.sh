@@ -27,7 +27,6 @@ help() {
     echo "  -s <ssh>    SSH destination (user@host or SSH config alias)"
     echo "  -d <folder> Existing writable destination folder"
     echo "  -p <port>   Optional fixed destination port (default: random)"
-    echo "  -a          Verify SHA256 after each copy"
     echo "  -f          Force overwrite of differing files; identical files are skipped"
     echo "  -v          Verbose output, including selected ports"
     echo "  -h          Show help"
@@ -36,7 +35,6 @@ help() {
 }
 
 FORCE=false
-DO_SHA=false
 VERBOSE=false
 FIXED_PORT=""
 FILES=()
@@ -57,7 +55,6 @@ while [ "$#" -gt 0 ]; do
             esac
             shift 2 ;;
         -f) FORCE=true; shift ;;
-        -a) DO_SHA=true; shift ;;
         -v) VERBOSE=true; shift ;;
         -h|--help) help; exit 0 ;;
         --) shift; FILES+=("$@"); break ;;
@@ -74,6 +71,7 @@ is_installed pv
 is_installed nc
 is_installed ssh
 is_installed sha256sum
+is_installed python3
 
 # Validate every input before starting any transfer. Duplicate basenames would
 # overwrite each other in the shared destination folder.
@@ -82,7 +80,7 @@ for FILE in "${FILES[@]}"; do
     [ -f "$FILE" ] && [ -r "$FILE" ] || error_exit "nc_wire: Not a readable file: $FILE"
     NAME=${FILE##*/}
     for PREVIOUS in "${NAMES[@]}"; do
-        [ "$NAME" != "$PREVIOUS" ] || error_exit "nc_wire: Duplicate destination filename: $NAME"
+        [ "$NAME" != "$PREVIOUS" ] && [ "$NAME" != "$PREVIOUS.part" ] && [ "$NAME.part" != "$PREVIOUS" ] || error_exit "nc_wire: Duplicate destination filename: $NAME"
     done
     NAMES+=("$NAME")
 done
@@ -238,78 +236,167 @@ trap cleanup_receiver EXIT
 trap 'exit 130' INT
 trap 'exit 143' TERM
 
+# Embedded so the installed command remains a single file. Both hosts need Python 3.
+REMOTE_HELPER=$(cat <<'PY'
+import fcntl
+import hashlib
+import json
+import os
+import stat
+import subprocess
+import sys
+
+CHUNK = 64 * 1024 * 1024
+
+def regular(path):
+    if os.path.lexists(path) and not stat.S_ISREG(os.lstat(path).st_mode):
+        raise RuntimeError("Not a regular file: " + path)
+
+def digest(path):
+    h = hashlib.sha256()
+    with open(path, "rb") as stream:
+        for data in iter(lambda: stream.read(1024 * 1024), b""):
+            h.update(data)
+    return h.hexdigest()
+
+mode, final = sys.argv[1:3]
+part = final + ".part"
+try:
+    regular(final)
+    regular(part)
+    if mode == "prepare":
+        expected, size, force = sys.argv[3:6]
+        size = int(size)
+        if os.path.exists(final):
+            if digest(final) == expected:
+                print(json.dumps({"state": "skip"}))
+                sys.exit(0)
+            if force != "true":
+                print(json.dumps({"state": "refuse"}))
+                sys.exit(0)
+            if os.path.exists(part):
+                raise RuntimeError("Both final and .part exist; move one aside before forcing replacement")
+            os.rename(final, part)
+        chunks = []
+        if os.path.exists(part):
+            with open(part, "rb") as stream:
+                remaining = min(os.fstat(stream.fileno()).st_size, size)
+                while remaining:
+                    length = min(CHUNK, remaining)
+                    # Only reuse a short last chunk if it reaches the source EOF.
+                    if length < CHUNK and stream.tell() + length != size:
+                        break
+                    data = stream.read(length)
+                    if len(data) != length:
+                        raise RuntimeError("Partial file changed while hashing")
+                    chunks.append([length, hashlib.sha256(data).hexdigest()])
+                    remaining -= length
+        print(json.dumps({"state": "resume", "chunks": chunks}))
+    elif mode == "receive":
+        offset = int(sys.argv[3])
+        with open(part, "a+b") as stream:
+            fcntl.flock(stream, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            if os.fstat(stream.fileno()).st_size < offset:
+                raise RuntimeError("Partial file became shorter than verified prefix")
+            stream.truncate(offset)
+            stream.seek(offset)
+            result = subprocess.run(sys.argv[4:], stdin=subprocess.DEVNULL, stdout=stream)
+            stream.flush()
+            os.fsync(stream.fileno())
+            if result.returncode:
+                raise RuntimeError("Receiver failed (status %s)" % result.returncode)
+    elif mode == "finish":
+        expected, size = sys.argv[3:5]
+        with open(part, "r+b") as stream:
+            fcntl.flock(stream, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            # A verified full source prefix can have extra stale bytes after it.
+            if os.fstat(stream.fileno()).st_size != int(size):
+                raise RuntimeError("Size mismatch; partial file retained for retry")
+            if digest(part) != expected:
+                raise RuntimeError("SHA256 mismatch; partial file retained for retry")
+            stream.flush()
+            os.fsync(stream.fileno())
+            # Publish without replacing a file created by another process.
+            os.link(part, final)
+            os.unlink(part)
+        print("nc_wire: Verified and completed " + final)
+    else:
+        raise RuntimeError("Unknown operation")
+except (OSError, RuntimeError, ValueError) as exc:
+    print("nc_wire: " + str(exc), file=sys.stderr)
+    sys.exit(1)
+PY
+)
+build_remote_command() {
+    local command="python3 -c $(shell_quote "$REMOTE_HELPER")"
+    local argument
+    for argument in "$@"; do command="$command $(shell_quote "$argument")"; done
+    REMOTE_COMMAND=$command
+}
+remote_operation() {
+    build_remote_command "$@"
+    ssh -n "$DEST_SSH" "$REMOTE_COMMAND"
+}
+
 TRANSFER_STATUS=0
 for FILE in "${FILES[@]}"; do
-    # Prefix relative paths so files beginning with '-' are passed as filenames.
     case "$FILE" in /*) IN_FILE=$FILE ;; *) IN_FILE="$PWD/$FILE" ;; esac
     OUT_FILE=${FILE##*/}
-    REMOTE_FILE=$(shell_quote "${DEST_FOLDER%/}/$OUT_FILE")
-    SRC_SHA256=""
-    ALLOW_OVERWRITE=false
-    DEST_STATE=$(ssh -n "$DEST_SSH" "if test -L $REMOTE_FILE; then echo other; elif test -f $REMOTE_FILE; then echo file; elif test -e $REMOTE_FILE; then echo other; else echo missing; fi") || error_exit "nc_wire: Cannot inspect destination file."
-    case "$DEST_STATE" in
-        file)
-            SRC_SHA256=$(sha256sum "$IN_FILE" | awk '{print $1}') || error_exit "nc_wire: Cannot checksum source file."
-            DEST_SHA256=$(ssh -n "$DEST_SSH" "sha256sum $REMOTE_FILE" | awk '{print $1}') || error_exit "nc_wire: Cannot checksum destination file."
-            if [ "$SRC_SHA256" = "$DEST_SHA256" ]; then
-                echo "nc_wire: Skipping $OUT_FILE (SHA256 matches)."
-                continue
-            fi
-            if [ "$FORCE" != true ]; then
-                echo "nc_wire: Refusing to overwrite $OUT_FILE (SHA256 differs). Use -f to overwrite."
-                TRANSFER_STATUS=1
-                continue
-            fi
-            ALLOW_OVERWRITE=true
-            ;;
-        missing) ;;
-        other) error_exit "nc_wire: Destination is not a regular file: $OUT_FILE" ;;
-        *) error_exit "nc_wire: Invalid destination file status." ;;
-    esac
+    DEST_FILE="${DEST_FOLDER%/}/$OUT_FILE"
     SRC_SIZE=$(wc -c < "$IN_FILE") || error_exit "nc_wire: Cannot read source size."
-    if [ "$DO_SHA" = true ] && [ -z "$SRC_SHA256" ]; then
-        SRC_SHA256=$(sha256sum "$IN_FILE" | awk '{print $1}') || error_exit "nc_wire: Cannot checksum source file."
+    SRC_SHA256=$(sha256sum "$IN_FILE" | awk '{print $1}') || error_exit "nc_wire: Cannot checksum source file."
+    vprint "nc_wire: Checking existing file and partial chunks for $OUT_FILE..."
+    MANIFEST=$(remote_operation prepare "$DEST_FILE" "$SRC_SHA256" "$SRC_SIZE" "$FORCE") || error_exit "nc_wire: Cannot prepare destination."
+    RESUME=$(printf '%s' "$MANIFEST" | python3 -c '
+import hashlib, json, sys
+manifest = json.load(sys.stdin)
+if manifest["state"] != "resume":
+    print(manifest["state"])
+else:
+    offset = 0
+    with open(sys.argv[1], "rb") as stream:
+        for length, expected in manifest["chunks"]:
+            data = stream.read(length)
+            if len(data) != length or hashlib.sha256(data).hexdigest() != expected:
+                break
+            offset += length
+    print(offset)
+' "$IN_FILE") || error_exit "nc_wire: Cannot verify partial chunks."
+    case "$RESUME" in
+        skip) echo "nc_wire: Skipping $OUT_FILE (SHA256 matches)."; continue ;;
+        refuse)
+            echo "nc_wire: Refusing to overwrite $OUT_FILE (SHA256 differs). Use -f to overwrite."
+            TRANSFER_STATUS=1
+            continue ;;
+        ''|*[!0-9]*) error_exit "nc_wire: Invalid resume offset." ;;
+    esac
+    echo "nc_wire: $OUT_FILE: resuming at byte $RESUME of $SRC_SIZE."
+    if [ "$RESUME" -lt "$SRC_SIZE" ]; then
+        DEST_PORT=$(select_remote_port) || error_exit "nc_wire: Cannot select a free destination port."
+        case "$DEST_PORT" in ''|*[!0-9]*) error_exit "nc_wire: Invalid port returned by remote host." ;; esac
+        [ "${#DEST_PORT}" -le 5 ] && [ "$DEST_PORT" -ge 1 ] && [ "$DEST_PORT" -le 65535 ] || error_exit "nc_wire: Invalid port returned by remote host."
+        vprint "nc_wire: Starting receiver on port $DEST_PORT"
+        build_remote_command receive "$DEST_FILE" "$RESUME" nc $NC_DEST_OPTIONS "$DEST_PORT"
+        ssh -n "$DEST_SSH" "$REMOTE_COMMAND" &
+        RECEIVER_PID=$!
+        sleep 3
+        if ! python3 -c '
+import shutil, sys
+with open(sys.argv[1], "rb") as stream:
+    stream.seek(int(sys.argv[2]))
+    shutil.copyfileobj(stream, sys.stdout.buffer, 1024 * 1024)
+' "$IN_FILE" "$RESUME" | pv -s "$((SRC_SIZE - RESUME))" | send_file; then
+            error_exit "nc_wire: Sender failed; .part retained for retry."
+        fi
+        wait "$RECEIVER_PID"
+        RECEIVER_STATUS=$?
+        RECEIVER_PID=""
+        [ "$RECEIVER_STATUS" -eq 0 ] || error_exit "nc_wire: Receiver failed; .part retained for retry."
+    else
+        # Empty files and already complete partial files need no data connection.
+        remote_operation receive "$DEST_FILE" "$RESUME" true || error_exit "nc_wire: Cannot prepare complete partial file."
     fi
-    DEST_PORT=$(select_remote_port) || error_exit "nc_wire: Cannot select a free destination port."
-    case "$DEST_PORT" in ''|*[!0-9]*) error_exit "nc_wire: Invalid port returned by remote host." ;; esac
-    [ "${#DEST_PORT}" -le 5 ] && [ "$DEST_PORT" -ge 1 ] && [ "$DEST_PORT" -le 65535 ] || error_exit "nc_wire: Invalid port returned by remote host."
-    vprint "nc_wire: Transferring $IN_FILE to $DEST_SSH:$DEST_FOLDER/$OUT_FILE on port $DEST_PORT"
-
-    vprint "nc_wire: Starting receiver on $DEST_SSH (will wait 3 seconds before starting sender)"
-    # Do not clobber a file created since the initial absence check.
-    REMOTE_GUARD="set -C;"
-    if [ "$ALLOW_OVERWRITE" = true ]; then REMOTE_GUARD=""; fi
-    ssh -n "$DEST_SSH" "$REMOTE_GUARD nc $NC_DEST_OPTIONS $DEST_PORT > $REMOTE_FILE" &
-    RECEIVER_PID=$!
-    sleep 3
-    vprint "nc_wire: Starting sender"
-    if ! pv "$IN_FILE" | send_file; then
-        error_exit "nc_wire: Sender failed; destination file may be incomplete."
-    fi
-
-    # Sender EOF only means the bytes were handed to the network. The receiver
-    # must finish writing and close the file before we report success or hash it.
-    vprint "nc_wire: Waiting for receiver to finish writing..."
-    wait "$RECEIVER_PID"
-    RECEIVER_STATUS=$?
-    RECEIVER_PID=""
-    if [ "$RECEIVER_STATUS" -ne 0 ]; then
-        error_exit "nc_wire: Receiver failed (status $RECEIVER_STATUS); destination file may be incomplete."
-    fi
-
-    DEST_SIZE=$(ssh -n "$DEST_SSH" "wc -c < $REMOTE_FILE") || error_exit "nc_wire: Cannot read destination size."
-    if [ "$SRC_SIZE" -ne "$DEST_SIZE" ]; then
-        error_exit "nc_wire: Size mismatch: source $SRC_SIZE bytes; destination $DEST_SIZE bytes."
-    fi
-
-    if [ "$DO_SHA" = true ]; then
-        vprint "nc_wire: Computing sha256sum of \"$DEST_FOLDER\"/\"$OUT_FILE\""
-        DEST_SHA256=$(ssh "$DEST_SSH" "sha256sum $REMOTE_FILE" | awk '{print $1}') || error_exit "nc_wire: Cannot checksum destination file."
-        vprint "nc_wire: DEST_SHA256: \"$DEST_SHA256\""
-        if [ "$SRC_SHA256" != "$DEST_SHA256" ]; then error_exit "nc_wire: SHA256 mismatch: \"$SRC_SHA256\" != \"$DEST_SHA256\""; fi
-        vprint "nc_wire: SHA256 match: \"$SRC_SHA256\""
-    fi
-
+    remote_operation finish "$DEST_FILE" "$SRC_SHA256" "$SRC_SIZE" || error_exit "nc_wire: Verification failed; .part retained for retry."
 done
 
 exit "$TRANSFER_STATUS"
