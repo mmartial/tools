@@ -39,7 +39,7 @@ class SenderTest(unittest.TestCase):
             worker = threading.Thread(target=receive)
             worker.start()
             result = subprocess.run(
-                ['bash', '-c', function + '\nUSE_PYTHON_SENDER=true\n'
+                ['bash', '-c', function + '\n'
                  'DEST_IP=127.0.0.1\nDEST_PORT=$1\nsend_file', 'test',
                  str(listener.getsockname()[1])],
                 input=payload, capture_output=True, timeout=30,

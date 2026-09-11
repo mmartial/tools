@@ -1,15 +1,15 @@
 # nc_wire
 
-Copy one or more files sequentially to a remote folder using SSH for control and netcat for data transfer.
+Copy one or more files sequentially to a remote folder using SSH for control and Python TCP sockets for data transfer.
 
 ## Prerequisites
 
-- Local: `pv`, `nc`, `ssh`, `sha256sum`, and `python3`.
-- Remote: `python3`, `nc`, `od`, and either `ss` or `lsof` to find free ports.
+- Local: `pv`, `ssh`, `sha256sum`, and `python3`.
+- Remote: `python3`.
 - SSH access to the destination and an existing writable destination folder.
 - TCP ports 49152–65535 on the destination must be reachable from the sender by default, or allow the specific port supplied with `-p`.
 
-Apple/macOS, OpenBSD, GNU (Homebrew), traditional netcat, and Ncat are detected independently on each host. For GNU and Apple netcat, a Python TCP sender flushes all bytes and half-closes the connection before waiting for the receiver. This avoids GNU `-c` resetting a connection with queued data and Apple’s timeout-based EOF handling. Remote reception still uses netcat.
+Python handles both sending and receiving, including explicit EOF shutdown. Netcat is not required on either host.
 
 ## Usage
 
@@ -27,7 +27,7 @@ Use actual paths for quoted filenames; tilde expansion works only when the tilde
 
 Supply files directly, including shell globs. Use `--` before filenames starting with a dash. All files go to the same folder under their original basenames; duplicate basenames are rejected before transfer. Existing files are compared using SHA256. Identical files are skipped, including with `-f`. Differing files are left untouched unless `-f` (force) is supplied. Refused files are reported, remaining files are processed, and the command exits nonzero if any overwrite was refused. Directories and symlinks are refused.
 
-By default, for each file, the command uses SSH to select a fresh random port in 49152–65535, skipping existing listeners and retrying up to 100 candidates. Selection is randomized on every invocation. The check reduces collisions but does not reserve the port between selection and starting netcat.
+By default, for each file, the Python receiver binds a fresh random port in 49152–65535, retrying up to 100 candidates if binding fails. The socket reserves the port immediately. The receiver reports its port over SSH once it is listening, and the sender waits for that readiness signal before connecting.
 
 Files transfer sequentially. The command waits for the receiver to finish writing, checks byte counts, and always verifies each file's SHA256 before publishing it. Any transfer or checksum failure stops the command. Use `-v` to see the selected ports, or `-h` for help.
 

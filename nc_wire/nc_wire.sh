@@ -6,7 +6,7 @@ set -o pipefail
 # must be on the same network
 # requires:
 # pv (brew install pv)
-# nc (Apple, OpenBSD, GNU, traditional netcat, or Ncat)
+# python3 (TCP transport and file verification)
 # ssh (openssh)
 # sha256sum (brew install coreutils)
 
@@ -21,8 +21,8 @@ vprint() { if [ "$VERBOSE" = true ]; then echo "$1"; fi; }
 shell_quote() { local value=${1//\'/\'\\\'\'}; printf "'%s'" "$value"; }
 
 help() {
-    echo "Usage: $0 [-v] [-a] [-f] [-p <port>] -i <ip> -s <ssh> -d <folder> [--] <file> [file ...]"
-    echo "Copies files sequentially to one remote folder using SSH and netcat."
+    echo "Usage: $0 [-v] [-f] [-p <port>] -i <ip> -s <ssh> -d <folder> [--] <file> [file ...]"
+    echo "Copies files sequentially to one remote folder using SSH and Python TCP sockets."
     echo "  -i <ip>     Destination IP for the data connection"
     echo "  -s <ssh>    SSH destination (user@host or SSH config alias)"
     echo "  -d <folder> Existing writable destination folder"
@@ -31,7 +31,7 @@ help() {
     echo "  -v          Verbose output, including selected ports"
     echo "  -h          Show help"
     echo "By default, a random free remote port in 49152-65535 is selected for each file."
-    echo "Example: $0 -i 10.0.0.13 -s motoko -d /4TB -a ~/Downloads/*.safetensors"
+    echo "Example: $0 -i 10.0.0.13 -s motoko -d /4TB ~/Downloads/*.safetensors"
 }
 
 FORCE=false
@@ -68,7 +68,6 @@ if [ "${#FILES[@]}" -eq 0 ] || [ -z "$DEST_IP" ] || [ -z "$DEST_SSH" ] || [ -z "
 fi
 
 is_installed pv
-is_installed nc
 is_installed ssh
 is_installed sha256sum
 is_installed python3
@@ -85,65 +84,8 @@ for FILE in "${FILES[@]}"; do
     NAMES+=("$NAME")
 done
 
-# Options with the same name can mean different things across nc variants.
-# Set sender and listener options together, using the help from each host.
-detect_nc() {
-    local nc_help="$1"
-    NC_SEND=()
-    NC_LISTEN=""
-    NC_VARIANT=""
-    case "$nc_help" in
-        *--apple-*|*'tcp adaptive write timeout'*)
-            NC_VARIANT="Apple netcat"
-            # Apple nc has no EOF shutdown flag. Bound the final read wait.
-            NC_SEND=(-w 3)
-            NC_LISTEN="-l"
-            ;;
-        *'GNU netcat'*)
-            NC_VARIANT="GNU netcat"
-            NC_SEND=(-c)
-            NC_LISTEN="-l -p"
-            ;;
-        *Ncat*)
-            NC_VARIANT="Ncat"
-            NC_SEND=(--send-only)
-            NC_LISTEN="-l"
-            ;;
-        *)
-            if printf '%s\n' "$nc_help" | grep -Eiq -- '^[[:space:]]*-N[[:space:]]+.*shutdown'; then
-                NC_VARIANT="OpenBSD netcat"
-                NC_SEND=(-N)
-                NC_LISTEN="-l"
-            elif printf '%s\n' "$nc_help" | grep -Eq -- '^[[:space:]]*-q[[:space:]]'; then
-                NC_VARIANT="netcat with EOF quit support"
-                NC_SEND=(-q 0)
-                NC_LISTEN="-l -p"
-            else
-                return 1
-            fi
-            ;;
-    esac
-}
-
-vprint "nc_wire: Detecting local nc capabilities..."
-LOCAL_NC_HELP=$(nc -h 2>&1)
-if ! detect_nc "$LOCAL_NC_HELP"; then
-    error_exit "nc_wire: Unsupported local nc implementation. Check nc -h."
-fi
-NC_SRC_OPTIONS=("${NC_SEND[@]}")
-# GNU -c can reset the socket while data is still queued. Apple nc only
-# offers a timeout. Use an explicit TCP half-close for these senders.
-USE_PYTHON_SENDER=false
-case "$NC_VARIANT" in
-    "GNU netcat"|"Apple netcat")
-        is_installed python3
-        USE_PYTHON_SENDER=true ;;
-esac
-vprint "nc_wire: Local $NC_VARIANT; Python TCP sender: $USE_PYTHON_SENDER"
-
 send_file() {
-    if [ "$USE_PYTHON_SENDER" = true ]; then
-        python3 -c '
+    python3 -c '
 import socket
 import sys
 try:
@@ -161,9 +103,6 @@ except (OSError, ValueError) as exc:
     print("nc_wire: TCP sender failed: " + str(exc), file=sys.stderr)
     sys.exit(1)
 ' "$DEST_IP" "$DEST_PORT"
-    else
-        nc "${NC_SRC_OPTIONS[@]}" "$DEST_IP" "$DEST_PORT"
-    fi
 }
 
 # Pre-flight checks
@@ -174,63 +113,14 @@ vprint "nc_wire: Checking destination folder on remote..."
 REMOTE_FOLDER=$(shell_quote "$DEST_FOLDER")
 if ! ssh -n "$DEST_SSH" "test -d $REMOTE_FOLDER && test -w $REMOTE_FOLDER"; then error_exit "nc_wire: Error: Destination folder \"$DEST_FOLDER\" does not exist or is not writable on $DEST_SSH"; fi
 
-# Detect remote nc capabilities
-vprint "nc_wire: Probing remote nc capabilities..."
-REMOTE_NC_HELP=$(ssh "$DEST_SSH" "nc -h 2>&1")
-if ! detect_nc "$REMOTE_NC_HELP"; then
-    error_exit "nc_wire: Unsupported remote nc implementation on $DEST_SSH. Check nc -h there."
-fi
-NC_DEST_OPTIONS=$NC_LISTEN
-vprint "nc_wire: Remote $NC_VARIANT options: $NC_DEST_OPTIONS"
-
-# Selection happens on the SSH host; no probe connection is made to nc,
-# since that would consume its one allowed connection.
-select_remote_port() {
-    ssh -n "$DEST_SSH" "requested_port='$FIXED_PORT';"' # nc_wire: select free port
-        if command -v ss >/dev/null 2>&1; then
-            checker=ss
-        elif command -v lsof >/dev/null 2>&1; then
-            checker=lsof
-        else
-            echo "nc_wire: Install ss or lsof on the destination." >&2
-            exit 1
-        fi
-        attempt=0
-        while [ "$attempt" -lt 100 ]; do
-            attempt=$((attempt + 1))
-            if [ -n "$requested_port" ]; then
-                port=$requested_port
-            else
-                random=$(od -An -N2 -tu2 /dev/urandom) || exit 1
-                port=$((49152 + random % 16384))
-            fi
-            if [ "$checker" = ss ]; then
-                listeners=$(ss -H -ltn "sport = :$port") || exit 1
-            else
-                listeners=$(lsof -nP -iTCP:$port -sTCP:LISTEN 2>/dev/null)
-                status=$?
-                [ "$status" -le 1 ] || exit 1
-            fi
-            if [ -z "$listeners" ]; then
-                echo "$port"
-                exit 0
-            fi
-            if [ -n "$requested_port" ]; then
-                echo "nc_wire: Requested port $requested_port is occupied." >&2
-                exit 1
-            fi
-        done
-        echo "nc_wire: No free random port found after 100 attempts." >&2
-        exit 1
-    '
-}
-
 RECEIVER_PID=""
+READY_FILE=""
 cleanup_receiver() {
     if [ -n "$RECEIVER_PID" ]; then
         kill "$RECEIVER_PID" 2>/dev/null || true
         wait "$RECEIVER_PID" 2>/dev/null || true
     fi
+    [ -z "$READY_FILE" ] || rm -f "$READY_FILE"
 }
 trap cleanup_receiver EXIT
 trap 'exit 130' INT
@@ -243,7 +133,8 @@ import hashlib
 import json
 import os
 import stat
-import subprocess
+import random
+import socket
 import sys
 
 CHUNK = 64 * 1024 * 1024
@@ -300,11 +191,30 @@ try:
                 raise RuntimeError("Partial file became shorter than verified prefix")
             stream.truncate(offset)
             stream.seek(offset)
-            result = subprocess.run(sys.argv[4:], stdin=subprocess.DEVNULL, stdout=stream)
+            if sys.argv[4] != "complete":
+                requested = int(sys.argv[4]) if sys.argv[4] else None
+                with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as listener:
+                    listener.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+                    for attempt in range(100):
+                        port = requested or random.SystemRandom().randrange(49152, 65536)
+                        try:
+                            listener.bind(("", port))
+                            break
+                        except OSError:
+                            if requested or attempt == 99:
+                                raise
+                    listener.listen(1)
+                    listener.settimeout(30)
+                    print(port, flush=True)
+                    connection, _ = listener.accept()
+                    with connection:
+                        while True:
+                            data = connection.recv(1024 * 1024)
+                            if not data:
+                                break
+                            stream.write(data)
             stream.flush()
             os.fsync(stream.fileno())
-            if result.returncode:
-                raise RuntimeError("Receiver failed (status %s)" % result.returncode)
     elif mode == "finish":
         expected, size = sys.argv[3:5]
         with open(part, "r+b") as stream:
@@ -372,14 +282,22 @@ else:
     esac
     echo "nc_wire: $OUT_FILE: resuming at byte $RESUME of $SRC_SIZE."
     if [ "$RESUME" -lt "$SRC_SIZE" ]; then
-        DEST_PORT=$(select_remote_port) || error_exit "nc_wire: Cannot select a free destination port."
-        case "$DEST_PORT" in ''|*[!0-9]*) error_exit "nc_wire: Invalid port returned by remote host." ;; esac
-        [ "${#DEST_PORT}" -le 5 ] && [ "$DEST_PORT" -ge 1 ] && [ "$DEST_PORT" -le 65535 ] || error_exit "nc_wire: Invalid port returned by remote host."
-        vprint "nc_wire: Starting receiver on port $DEST_PORT"
-        build_remote_command receive "$DEST_FILE" "$RESUME" nc $NC_DEST_OPTIONS "$DEST_PORT"
-        ssh -n "$DEST_SSH" "$REMOTE_COMMAND" &
+        READY_FILE=$(mktemp) || error_exit "nc_wire: Cannot create receiver readiness file."
+        build_remote_command receive "$DEST_FILE" "$RESUME" "$FIXED_PORT"
+        ssh -n "$DEST_SSH" "$REMOTE_COMMAND" > "$READY_FILE" &
         RECEIVER_PID=$!
-        sleep 3
+        # The listener publishes its port only after binding and listening.
+        for ((attempt=0; attempt<300; attempt++)); do
+            [ ! -s "$READY_FILE" ] || break
+            kill -0 "$RECEIVER_PID" 2>/dev/null || break
+            sleep 0.1
+        done
+        read -r DEST_PORT < "$READY_FILE"
+        rm -f "$READY_FILE"
+        READY_FILE=""
+        case "$DEST_PORT" in ''|*[!0-9]*) error_exit "nc_wire: Receiver failed to become ready." ;; esac
+        [ "${#DEST_PORT}" -le 5 ] && [ "$DEST_PORT" -ge 1 ] && [ "$DEST_PORT" -le 65535 ] || error_exit "nc_wire: Invalid port returned by remote host."
+        vprint "nc_wire: Receiver ready on port $DEST_PORT"
         if ! python3 -c '
 import shutil, sys
 with open(sys.argv[1], "rb") as stream:
@@ -394,7 +312,7 @@ with open(sys.argv[1], "rb") as stream:
         [ "$RECEIVER_STATUS" -eq 0 ] || error_exit "nc_wire: Receiver failed; .part retained for retry."
     else
         # Empty files and already complete partial files need no data connection.
-        remote_operation receive "$DEST_FILE" "$RESUME" true || error_exit "nc_wire: Cannot prepare complete partial file."
+        remote_operation receive "$DEST_FILE" "$RESUME" complete || error_exit "nc_wire: Cannot prepare complete partial file."
     fi
     remote_operation finish "$DEST_FILE" "$SRC_SHA256" "$SRC_SIZE" || error_exit "nc_wire: Verification failed; .part retained for retry."
 done
