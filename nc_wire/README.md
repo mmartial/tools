@@ -77,9 +77,9 @@ nc_wire -r --dry-run -i 10.11.12.15 -s user@nas -d /volume1/backup /local/source
 
 The preview uses a single SSH session and reads file metadata only. It does not hash file contents, open a data listener, create directories or transfer state, or modify existing files or partial transfers. The destination root must already exist and be writable, as for an actual copy.
 
-It reports missing files to copy, missing folders to create, existing same-size files that need checksum checks on the actual run, size mismatches that would be replaced with `-f` or refused without it, and path/type conflicts. With `--skip-verify`, same-size files are reported as skips instead. `-v` lists individual planned actions. Known refusals or conflicts return a nonzero exit status.
+It reports missing files to copy, interrupted files that would resume from an existing `<name>.part`, missing folders to create, existing same-size files that need checksum checks on the actual run, size mismatches that would be replaced with `-f` or refused without it, and path/type conflicts. With `--skip-verify`, same-size files are reported as skips instead. `-v` lists individual planned actions. Known refusals or conflicts return a nonzero exit status.
 
-The preview cannot determine content equality from size alone. Its copy-byte total counts full sizes of files known to need copying; it excludes decisions pending checksum checks and does not estimate partial-prefix reuse. A real run checks the filesystem again.
+The preview cannot determine content equality from size alone. Its copy-byte total counts full sizes of files known to need copying from scratch; it excludes decisions pending checksum checks. For files with an existing `.part`, it reports a separate "would resume" count and a remaining-bytes estimate based only on the partial file's size, not its contents — the estimate assumes the partial prefix matches the source and is optimistic; if it doesn't match, the real run falls back to a full resend. A real run checks the filesystem (and, for partial files, content) again.
 
 ### Verbose two-line status
 
@@ -113,7 +113,7 @@ Python SHA256 is the default. Add `--use-sha256sum` to use an installed `sha256s
 
 Add `--check-size-only` to skip an existing completed file when its size matches the source, without hashing either file. This applies to individual-file and directory modes and works with `--dry-run`. Matching-size contents can differ or be corrupt; use the default checksum comparison when content equality matters.
 
-For individual-file mode, a differing size follows the normal `-f` overwrite rules. Existing `.part` files and forced replacements still undergo the same 64 MiB chunk hash checks before resuming. Newly transferred files still receive full SHA256 verification before publication. Directory mode resumes `.part` files the same way (64 MiB chunk hashes, resent tail only) unless `--skip-verify`/`--check-size-only` is set, in which case it retains its size-only restart behavior and retransmits interrupted files from the beginning. `--skip-verify` remains a directory-only alias for size-only checks.
+For individual-file mode, a differing size follows the normal `-f` overwrite rules. Existing `.part` files and forced replacements still undergo the same 64 MiB chunk hash checks before resuming. Newly transferred files still receive full SHA256 verification before publication. Directory mode resumes `.part` files the same way (64 MiB chunk hashes, resent tail only), regardless of `--skip-verify`/`--check-size-only`: those flags only change how a *complete* existing file is compared (size instead of a full hash), not how an interrupted partial file is resumed, which is always hash-verified. `--skip-verify` remains a directory-only alias for size-only checks of complete files.
 
 Individual-file progress is now rendered by the Python sender: a bar, percentage, total bytes including the resumed prefix, and average speed for bytes sent during this attempt. It seeks directly to the verified resume offset without a `pv` pipeline.
 

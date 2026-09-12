@@ -335,8 +335,13 @@ def inspect_server(root, sync):
             expected.add(entry['path'])
             try:
                 path = checked_path(root, entry['path'], entry['kind'] == 'dir', create=False)
-                result.append({'exists': os.path.exists(path),
-                               'size': os.stat(path).st_size if os.path.isfile(path) else None})
+                info = {'exists': os.path.exists(path),
+                        'size': os.stat(path).st_size if os.path.isfile(path) else None}
+                if entry['kind'] == 'file' and not info['exists']:
+                    part = path + '.part'
+                    if os.path.lexists(part) and stat.S_ISREG(os.lstat(part).st_mode):
+                        info['partial_size'] = os.stat(part).st_size
+                result.append(info)
             except (OSError, RuntimeError) as exc:
                 result.append({'error': str(exc)})
         print(json.dumps(result), flush=True)
@@ -360,7 +365,7 @@ def preview(code, sources, root, host, force, skip_verify, directory, verbose, s
                 names.add(name)
                 yield {'path': name, 'kind': 'file', 'size': info.st_size}
     command = 'python3 -u -c ' + shlex.quote(code) + ' --inspect ' + shlex.quote(root) + ' ' + str(sync).lower()
-    counts = dict(copy=0, check=0, skip=0, refuse=0, conflict=0, folders=0, bytes=0)
+    counts = dict(copy=0, check=0, skip=0, refuse=0, conflict=0, folders=0, bytes=0, resume=0, resume_bytes=0)
     process = subprocess.Popen(['ssh', '-T', host, command], stdin=subprocess.PIPE, stdout=subprocess.PIPE)
     try:
         iterator = iter(source_entries())
@@ -389,7 +394,7 @@ def preview(code, sources, root, host, force, skip_verify, directory, verbose, s
                         continue
                     action = 'folders'
                 elif not state['exists']:
-                    action = 'copy'
+                    action = 'resume' if 'partial_size' in state else 'copy'
                 elif state['size'] != entry['size']:
                     action = 'copy' if force else 'refuse'
                 else:
@@ -397,6 +402,8 @@ def preview(code, sources, root, host, force, skip_verify, directory, verbose, s
                 counts[action] += 1
                 if action == 'copy':
                     counts['bytes'] += entry['size']
+                elif action == 'resume':
+                    counts['resume_bytes'] += max(0, entry['size'] - min(state['partial_size'], entry['size']))
                 if (verbose and not (hide_skipped and action in ('skip', 'check'))) or action in ('refuse', 'conflict'):
                     print('nc_wire: Would %s: %s%s' % (action, ascii(entry['path']),
                           ' (' + state['error'] + ')' if 'error' in state else ''), flush=True)
@@ -420,14 +427,18 @@ def preview(code, sources, root, host, force, skip_verify, directory, verbose, s
         process.stdin.close()
         if process.wait(timeout=30):
             raise RuntimeError('Remote inspection failed')
-        print('nc_wire: Dry run: will copy %d files (%s); create %d folders; '
+        print('nc_wire: Dry run: will copy %d files (%s); resume %d interrupted files '
+              '(~%s remaining, unverified estimate); create %d folders; '
               '%d files already present, will check checksums on actual copy; '
               '%d size-matched files will be skipped; %d files would be refused; %d conflicts.' %
-              (counts['copy'], human_size(counts['bytes']), counts['folders'], counts['check'],
-               counts['skip'], counts['refuse'], counts['conflict']), flush=True)
+              (counts['copy'], human_size(counts['bytes']), counts['resume'], human_size(counts['resume_bytes']),
+               counts['folders'], counts['check'], counts['skip'], counts['refuse'], counts['conflict']), flush=True)
         if counts['check']:
             print('nc_wire: After checksum checks, differing files will be ' +
                   ('replaced.' if force else 'refused unless -f is supplied.'), flush=True)
+        if counts['resume']:
+            print('nc_wire: Resume estimates assume the existing .part prefix matches the source; '
+                  'a mismatch falls back to a full resend, checked on the actual copy.', flush=True)
         return 1 if counts['refuse'] or counts['conflict'] else 0
     finally:
         if process.poll() is None:
@@ -513,7 +524,7 @@ def server(root, port, force, skip_verify, sync):
                                 status.append(None)
                             elif os.path.exists(path):
                                 status.append({'size': os.stat(path).st_size} if skip_verify else {'sha256': digest(path)})
-                            elif not skip_verify and os.path.lexists(part) and stat.S_ISREG(os.lstat(part).st_mode):
+                            elif os.path.lexists(part) and stat.S_ISREG(os.lstat(part).st_mode):
                                 status.append({'chunks': chunk_hashes(part, entry['size'])})
                             else:
                                 status.append({})

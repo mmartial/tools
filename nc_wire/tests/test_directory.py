@@ -171,6 +171,18 @@ os.execl('/bin/sh', 'sh', '-c', 'exec ' + command)
             self.run_copy('--dry-run', '-p', str(listener.getsockname()[1]))
         self.assertEqual(list(self.dest.iterdir()), [])
 
+    def test_dry_run_reports_resume_estimate_for_partial_file(self):
+        (self.source / 'big').write_bytes(b'x' * 1000)
+        (self.dest / 'big.part').write_bytes(b'x' * 400)
+        self.env['NO_HASH'] = '1'
+        result = self.run_copy('--dry-run', '-v')
+        self.assertIn("Would resume: 'big'", result.stdout)
+        self.assertIn('resume 1 interrupted files (~600 B remaining', result.stdout)
+        self.assertIn('unverified estimate', result.stdout)
+        self.assertIn('Resume estimates assume', result.stdout)
+        self.assertFalse((self.dest / 'big').exists())
+        self.assertEqual((self.dest / 'big.part').read_bytes(), b'x' * 400)
+
     def test_dry_run_individual_files(self):
         source = self.source / 'file & spaces'
         source.write_bytes(b'hello')
@@ -331,6 +343,17 @@ os.execl('/bin/sh', 'sh', '-c', 'exec ' + command)
         corrupted[0] ^= 1
         (self.dest / 'big.part').write_bytes(bytes(corrupted))
         result = self.run_copy()
+        self.assertIn('1 copied', result.stdout)
+        self.assertEqual((self.dest / 'big').read_bytes(), payload)
+        self.assertFalse((self.dest / 'big.part').exists())
+
+    def test_skip_verify_still_resumes_matching_partial_prefix(self):
+        chunk = 64 * 1024 * 1024
+        payload = (bytes(range(256)) * ((chunk + 4096) // 256 + 1))[:chunk + 4096]
+        (self.source / 'big').write_bytes(payload)
+        (self.dest / 'big.part').write_bytes(payload[:chunk])
+        self.env['FORBID_FRESH_WRITE'] = '1'
+        result = self.run_copy('--skip-verify')
         self.assertIn('1 copied', result.stdout)
         self.assertEqual((self.dest / 'big').read_bytes(), payload)
         self.assertFalse((self.dest / 'big.part').exists())
