@@ -38,6 +38,8 @@ help() {
     echo "  -f          Force overwrite of differing files; identical files are skipped"
     echo "  -v          Verbose output, including selected ports. In Directory mode: per-file history and two-line live status"
     echo "  --dry-run   Preview changes using file sizes; do not write or hash files"
+    echo "  --sync      Directory mode: delete destination-only entries after successful copying"
+    echo "  --hide-skipped  Suppress per-file skip history (counts remain visible)"
     echo "  --use-sha256sum  Use sha256sum for whole-file hashes (default: Python)"
     echo "  --check-size-only  Skip completed files with matching sizes; retain partial chunk checks"
     echo "  --skip-verify  Directory mode: skip existing files with matching sizes, without SHA256"
@@ -47,6 +49,8 @@ help() {
     echo "Example: $0 -i 10.11.12.13 -s nas -d /NAS/backup ~/Downloads/*.safetensors"
 }
 
+SYNC=false
+HIDE_SKIPPED=false
 USE_SHA256SUM=false
 CHECK_SIZE_ONLY=false
 DRY_RUN=false
@@ -79,6 +83,8 @@ while [ "$#" -gt 0 ]; do
         --color) COLOR=true; shift ;;
         --skip-verify) SKIP_VERIFY=true; shift ;;
         --dry-run) DRY_RUN=true; shift ;;
+        --sync) SYNC=true; shift ;;
+        --hide-skipped|--do-not-show-skipped) HIDE_SKIPPED=true; shift ;;
         --use-sha256sum) USE_SHA256SUM=true; shift ;;
         --check-size-only) CHECK_SIZE_ONLY=true; SKIP_VERIFY=true; shift ;;
         -h|--help) help; exit 0 ;;
@@ -90,6 +96,10 @@ done
 if [ "${#FILES[@]}" -eq 0 ] || [ -z "$DEST_IP" ] || [ -z "$DEST_SSH" ] || [ -z "$DEST_FOLDER" ]; then
     help
     exit 1
+fi
+
+if [ "$SYNC" = true ] && [ "$DIRECTORY" != true ]; then
+    error_exit "nc_wire: --sync requires directory mode (-r)."
 fi
 
 if [ "$SKIP_VERIFY" = true ] && [ "$DIRECTORY" != true ] && [ "$CHECK_SIZE_ONLY" != true ]; then
@@ -253,14 +263,52 @@ def entries(root):
                 raise RuntimeError('Unsupported source type (symlink or special file): ' + path)
 
 
-def inspect_server(root):
+def extra_paths(root, expected):
+    """Plan from the top down; an absent directory represents its entire subtree."""
+    def walk(folder, prefix=''):
+        with os.scandir(folder) as scan:
+            children = sorted(scan, key=lambda entry: entry.name)
+        for child in children:
+            if not prefix and child.name == STATE:
+                continue
+            relative = prefix + child.name
+            directory = child.is_dir(follow_symlinks=False)
+            if relative not in expected:
+                yield relative, directory
+            elif directory:
+                yield from walk(child.path, relative + '/')
+    yield from walk(root)
+
+
+def remove_extra(root, relative, directory):
+    # Parent directories must still be real directories, never symlinks.
+    parent = relative.rsplit('/', 1)[0] if '/' in relative else None
+    if parent:
+        checked_path(root, parent, directory=True, create=False)
+    path = os.path.join(root, relative)
+    if directory and not os.path.islink(path):
+        shutil.rmtree(path)
+    else:
+        os.unlink(path)
+
+
+def inspect_server(root, sync):
     if not os.path.isdir(root) or not os.access(root, os.W_OK):
         raise RuntimeError('Destination folder must exist and be writable: ' + root)
     root = os.path.realpath(root)
+    expected = set()
     for line in sys.stdin.buffer:
         batch = json.loads(line)
+        if batch == {'removals': True}:
+            if not sync:
+                raise RuntimeError('Sync preview not authorized')
+            for relative, directory in extra_paths(root, expected):
+                print(json.dumps({'remove': relative, 'directory': directory}), flush=True)
+            print(json.dumps({'done': True}), flush=True)
+            continue
         result = []
         for entry in batch:
+            expected.add(entry['path'])
             try:
                 path = checked_path(root, entry['path'], entry['kind'] == 'dir', create=False)
                 result.append({'exists': os.path.exists(path),
@@ -270,7 +318,7 @@ def inspect_server(root):
         print(json.dumps(result), flush=True)
 
 
-def preview(code, sources, root, host, force, skip_verify, directory, verbose):
+def preview(code, sources, root, host, force, skip_verify, directory, verbose, sync, hide_skipped):
     def source_entries():
         if directory:
             if len(sources) != 1 or os.path.islink(sources[0]) or not os.path.isdir(sources[0]):
@@ -287,7 +335,7 @@ def preview(code, sources, root, host, force, skip_verify, directory, verbose):
                     raise RuntimeError('Duplicate destination filename: ' + name)
                 names.add(name)
                 yield {'path': name, 'kind': 'file', 'size': info.st_size}
-    command = 'python3 -u -c ' + shlex.quote(code) + ' --inspect ' + shlex.quote(root)
+    command = 'python3 -u -c ' + shlex.quote(code) + ' --inspect ' + shlex.quote(root) + ' ' + str(sync).lower()
     counts = dict(copy=0, check=0, skip=0, refuse=0, conflict=0, folders=0, bytes=0)
     process = subprocess.Popen(['ssh', '-T', host, command], stdin=subprocess.PIPE, stdout=subprocess.PIPE)
     try:
@@ -325,9 +373,26 @@ def preview(code, sources, root, host, force, skip_verify, directory, verbose):
                 counts[action] += 1
                 if action == 'copy':
                     counts['bytes'] += entry['size']
-                if verbose or action in ('refuse', 'conflict'):
+                if (verbose and not (hide_skipped and action in ('skip', 'check'))) or action in ('refuse', 'conflict'):
                     print('nc_wire: Would %s: %s%s' % (action, ascii(entry['path']),
                           ' (' + state['error'] + ')' if 'error' in state else ''), flush=True)
+        if sync:
+            process.stdin.write(b'{"removals": true}\n')
+            process.stdin.flush()
+            removed = 0
+            while True:
+                line = process.stdout.readline()
+                if not line:
+                    raise RuntimeError('Remote removal preview failed')
+                item = json.loads(line)
+                if item == {'done': True}:
+                    break
+                removed += 1
+                print('nc_wire: Would remove %s: %s' %
+                      ('directory and all contents' if item['directory'] else 'file/link', ascii(item['remove'])), flush=True)
+            print('nc_wire: %d destination-only entries would be removed after a successful copy.' % removed, flush=True)
+            if counts['refuse'] or counts['conflict']:
+                print('nc_wire: Known copy refusals/conflicts would prevent deletion on this run.', flush=True)
         process.stdin.close()
         if process.wait(timeout=30):
             raise RuntimeError('Remote inspection failed')
@@ -353,7 +418,7 @@ def preview(code, sources, root, host, force, skip_verify, directory, verbose):
         process.stdout.close()
 
 
-def server(root, port, force, skip_verify):
+def server(root, port, force, skip_verify, sync):
     if not os.path.isdir(root) or not os.access(root, os.W_OK):
         raise RuntimeError('Destination folder must exist and be writable: ' + root)
     root = os.path.realpath(root)
@@ -394,8 +459,26 @@ def server(root, port, force, skip_verify):
                     if receive(stream) != {'token': token}:
                         raise RuntimeError('Invalid transfer token')
                     connection.settimeout(None)
+                    expected, rescanned = set(), set()
+                    had_refusal = False
                     while True:
                         batch = receive(stream)
+                        if isinstance(batch, dict) and 'sync_scan' in batch:
+                            if not sync:
+                                raise RuntimeError('Sync not authorized')
+                            rescanned.update(tuple(item) for item in batch['sync_scan'])
+                            send(stream, {'ok': True})
+                            continue
+                        if batch == {'sync_commit': True}:
+                            if not sync or had_refusal or rescanned != expected:
+                                raise RuntimeError('Source tree changed or copy incomplete; deletion aborted')
+                            # Complete the traversal before the first deletion, so scan errors are non-destructive.
+                            removals = list(extra_paths(root, {path for path, kind in expected}))
+                            for relative, directory in removals:
+                                remove_extra(root, relative, directory)
+                                send(stream, {'removed': relative, 'directory': directory})
+                            send(stream, {'sync_done': len(removals)})
+                            continue
                         if batch == {'done': True}:
                             send(stream, {'done': True})
                             return
@@ -403,6 +486,8 @@ def server(root, port, force, skip_verify):
                             raise RuntimeError('Invalid manifest batch')
                         paths, status = [], []
                         for entry in batch:
+                            if sync:
+                                expected.add((entry['path'], entry['kind']))
                             path = checked_path(root, entry['path'], entry['kind'] == 'dir', create=False)
                             paths.append(path)
                             if entry['kind'] == 'dir':
@@ -420,6 +505,7 @@ def server(root, port, force, skip_verify):
                                 checked_path(root, entry['path'], directory=True)
                                 continue
                             if action['action'] in ('skip', 'refuse'):
+                                had_refusal = had_refusal or action['action'] == 'refuse'
                                 continue
                             if action['action'] != 'write' or (old and not force):
                                 raise RuntimeError('Overwrite not authorized')
@@ -634,12 +720,12 @@ class Progress:
         print(self.paint(summary, code, sys.stdout), flush=True)
 
 
-def client(code, source, root, host, ip, port, force, verbose, color, skip_verify, use_sha256sum):
+def client(code, source, root, host, ip, port, force, verbose, color, skip_verify, use_sha256sum, sync, hide_skipped):
     if os.path.islink(source) or not os.path.isdir(source):
         raise RuntimeError('Source must be a directory, not a symlink')
     source = os.path.abspath(source)
     command = 'python3 -u -c ' + shlex.quote(code) + ' ' + ' '.join(
-        shlex.quote(x) for x in ('--receiver', root, port, force, skip_verify, use_sha256sum))
+        shlex.quote(x) for x in ('--receiver', root, port, force, skip_verify, use_sha256sum, sync))
     process = subprocess.Popen(['ssh', '-T', host, command], stdout=subprocess.PIPE)
     progress = Progress(color == 'true', verbose == 'true')
     progress.skip_label = 'size-matched/skipped' if skip_verify == 'true' else 'verified/skipped'
@@ -686,7 +772,8 @@ def client(code, source, root, host, ip, port, force, verbose, color, skip_verif
                         if old and (old['size'] == entry['size'] if skip_verify == 'true' else local_hash == old['sha256']):
                             send(stream, {'action': 'skip'}, flush=False)
                             progress.skipped += 1
-                            progress.record('Skipped (%s): %s' % (progress.skip_label, ascii(entry['path'])), '32')
+                            if hide_skipped != 'true':
+                                progress.record('Skipped (%s): %s' % (progress.skip_label, ascii(entry['path'])), '32')
                             continue
                         if old and force != 'true':
                             send(stream, {'action': 'refuse'}, flush=False)
@@ -726,6 +813,34 @@ def client(code, source, root, host, ip, port, force, verbose, color, skip_verif
                     progress.folders += batch_folders
                     progress.copied += progress.pending
                     progress.pending = 0
+                if sync == 'true' and not progress.refused:
+                    progress.current = ('Rescanning source before deletion', '', 0, 0)
+                    paths = []
+                    for entry in entries(source):
+                        paths.append([entry['path'], entry['kind']])
+                        if len(paths) == BATCH:
+                            send(stream, {'sync_scan': paths})
+                            if receive(stream) != {'ok': True}:
+                                raise RuntimeError('Source rescan not acknowledged')
+                            paths = []
+                    if paths:
+                        send(stream, {'sync_scan': paths})
+                        if receive(stream) != {'ok': True}:
+                            raise RuntimeError('Source rescan not acknowledged')
+                    progress.current = ('Removing destination-only entries', '', 0, 0)
+                    send(stream, {'sync_commit': True})
+                    while True:
+                        result = receive(stream)
+                        if 'sync_done' in result:
+                            print('nc_wire: Sync removed %d destination-only entries.' % result['sync_done'], flush=True)
+                            break
+                        message = 'Removed %s: %s' % ('directory and contents' if result['directory'] else 'file/link', ascii(result['removed']))
+                        if progress.verbose:
+                            progress.record(message, '33')
+                        else:
+                            print('nc_wire: ' + message, flush=True)
+                elif sync == 'true':
+                    print('nc_wire: Deletion skipped because some files were refused.', flush=True)
                 send(stream, {'done': True})
                 if receive(stream) != {'done': True}:
                     raise RuntimeError('Missing completion acknowledgement')
@@ -757,18 +872,19 @@ if __name__ == '__main__':
     signal.signal(signal.SIGTERM, interrupted)
     try:
         if sys.argv[1] == '--inspect':
-            inspect_server(sys.argv[2])
+            inspect_server(sys.argv[2], sys.argv[3] == 'true')
             result = 0
         elif sys.argv[1] == '--preview':
-            result = preview(sys.argv[2], sys.argv[9:], sys.argv[3], sys.argv[4],
+            result = preview(sys.argv[2], sys.argv[11:], sys.argv[3], sys.argv[4],
                              sys.argv[5] == 'true', sys.argv[6] == 'true',
-                             sys.argv[7] == 'true', sys.argv[8] == 'true')
+                             sys.argv[7] == 'true', sys.argv[8] == 'true',
+                             sys.argv[9] == 'true', sys.argv[10] == 'true')
         elif sys.argv[1] == '--receiver':
             USE_SHA256SUM = sys.argv[6] == 'true'
-            server(sys.argv[2], sys.argv[3], sys.argv[4] == 'true', sys.argv[5] == 'true')
+            server(sys.argv[2], sys.argv[3], sys.argv[4] == 'true', sys.argv[5] == 'true', sys.argv[7] == 'true')
             result = 0
         else:
-            USE_SHA256SUM = sys.argv[-1] == 'true'
+            USE_SHA256SUM = sys.argv[-3] == 'true'
             result = client(*sys.argv[1:])
         sys.exit(result)
     except KeyboardInterrupt:
@@ -780,9 +896,9 @@ if __name__ == '__main__':
 DIRECTORY_PY
 )
     if [ "$DRY_RUN" = true ]; then
-        exec python3 -c "$DIRECTORY_HELPER" --preview "$DIRECTORY_HELPER" "$DEST_FOLDER" "$DEST_SSH" "$FORCE" "$SKIP_VERIFY" "$DIRECTORY" "$VERBOSE" "${FILES[@]}"
+        exec python3 -c "$DIRECTORY_HELPER" --preview "$DIRECTORY_HELPER" "$DEST_FOLDER" "$DEST_SSH" "$FORCE" "$SKIP_VERIFY" "$DIRECTORY" "$VERBOSE" "$SYNC" "$HIDE_SKIPPED" "${FILES[@]}"
     fi
-    exec python3 -c "$DIRECTORY_HELPER" "$DIRECTORY_HELPER" "${FILES[0]}" "$DEST_FOLDER" "$DEST_SSH" "$DEST_IP" "$FIXED_PORT" "$FORCE" "$VERBOSE" "$COLOR" "$SKIP_VERIFY" "$USE_SHA256SUM"
+    exec python3 -c "$DIRECTORY_HELPER" "$DIRECTORY_HELPER" "${FILES[0]}" "$DEST_FOLDER" "$DEST_SSH" "$DEST_IP" "$FIXED_PORT" "$FORCE" "$VERBOSE" "$COLOR" "$SKIP_VERIFY" "$USE_SHA256SUM" "$SYNC" "$HIDE_SKIPPED"
 fi
 
 is_installed ssh
@@ -1011,7 +1127,7 @@ for FILE in "${FILES[@]}"; do
     if [ "$CHECK_SIZE_ONLY" = true ]; then
         SIZE_STATE=$(remote_operation size-check "$DEST_FILE" "$SRC_SIZE") || error_exit "nc_wire: Cannot check destination size."
         if [ "$SIZE_STATE" = skip ]; then
-            echo "nc_wire: Skipping $OUT_FILE (size matches; contents not verified)."
+            [ "$HIDE_SKIPPED" = true ] || echo "nc_wire: Skipping $OUT_FILE (size matches; contents not verified)."
             continue
         fi
     fi
@@ -1048,7 +1164,7 @@ else:
     print(offset)
 ' "$IN_FILE") || error_exit "nc_wire: Cannot verify partial chunks."
     case "$RESUME" in
-        skip) echo "nc_wire: Skipping $OUT_FILE (SHA256 matches)."; continue ;;
+        skip) [ "$HIDE_SKIPPED" = true ] || echo "nc_wire: Skipping $OUT_FILE (SHA256 matches)."; continue ;;
         refuse)
             echo "nc_wire: Refusing to overwrite $OUT_FILE (SHA256 differs). Use -f to overwrite."
             TRANSFER_STATUS=1

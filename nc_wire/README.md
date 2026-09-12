@@ -41,9 +41,31 @@ To use a firewall-approved port, add `-p 16432`. Valid ports are 1–65535. The 
 nc_wire -r -i 10.11.12.15 -s user@nas -d /volume1/backup /local/source
 ```
 
-`-r` (or `--recursive`) accepts exactly one source directory. It copies the **contents** into the existing destination: `/local/source/path/file` becomes `/volume1/backup/path/file`. A trailing slash on the source does not change this mapping. Directories are created as their turn in the sequential transfer is reached, immediately before their contents are processed; inspecting a manifest batch does not create future folders. Empty directories are still preserved; extra destination files are left untouched. Hidden files are included.
+`-r` (or `--recursive`) accepts exactly one source directory. It copies the **contents** into the existing destination: `/local/source/path/file` becomes `/volume1/backup/path/file`. A trailing slash on the source does not change this mapping. Directories are created as their turn in the sequential transfer is reached, immediately before their contents are processed; inspecting a manifest batch does not create future folders. Empty directories are still preserved; extra destination files are left untouched unless `--sync` is supplied. Hidden files are included.
 
 Directory mode uses one SSH session to start a persistent Python receiver and one raw TCP connection for the whole tree. Control messages and binary data use separate typed, length-prefixed frames with exact reads and complete socket writes. Entries are processed in batches of 128, with sequential file writes and SHA256 calculated while streaming new files. It avoids per-file SSH startup and a second full read of newly copied files. A live progress line shows receiver-confirmed copied files, folders ready, verified/skipped and refused files, total bytes sent, overall average speed (`avg`), and the current file with bytes/size, percentage, and its own average speed (`file`). The overall average includes connection setup and verification time; file speed measures bytes handed to the sender transport since that file started, and resets for each file. It refreshes five times per second in a terminal, or every five seconds when redirected to a log. During retry checks it shows the verification phase. Counts of copied files advance when each batch is acknowledged; folders ready counts receiver-confirmed created or existing source subdirectories after each batch, excluding the destination root. `-p` selects a fixed port for the session; otherwise the receiver reserves a random port. The data connection uses IPv4 and is unencrypted, like individual-file mode.
+
+### Synchronizing destination contents
+
+Add `--sync` with `-r` to remove destination files and folders that have no corresponding source path:
+
+Warning: sync is a destructive operation on the remote. If source has folder1 and destination has folder1 and folder2, folder2 will be removed as part of this operation, as such use with caution and perform a dry-run first to understand the impact the copy might have (recommanded add `--dry-run --check-size-only --hide-skipped`)
+
+```bash
+nc_wire -r --sync --dry-run --hide-skipped -i 10.11.12.15 -s user@nas -d /volume1/backup /local/source
+```
+
+Remove `--dry-run` to perform the copy and deletions. Sync still uses the existing overwrite rules: differing files require `-f` to replace, and `--check-size-only` changes how existing files are skipped.
+
+Deletion runs only after all copy batches succeed and no files are refused. The source is scanned again; if the source path/type set has changed or a scan fails, deletion is aborted. Failed or cancelled copies do not start deletion. Keep both trees stable during the run; the scan is not a filesystem snapshot. If cancellation or an error happens during deletion itself, earlier deletions remain applied and a retry can finish the sync.
+
+The destination is examined from the top down. An absent folder is removed with its entire subtree and appears as one `directory and all contents` entry. A folder that exists in the source is retained while its children are inspected individually. Symlinks that are extra are unlinked, never followed into their targets. The destination root and the reserved `.nc-wire-state` directory are always retained. An empty source therefore removes all other destination entries.
+
+Dry runs always list candidate removals, even without `-v` or with `--hide-skipped`. They never delete anything or create transfer state. The list is conditional on a successful copy; known refusals/conflicts are reported as preventing deletion. Without `--sync`, extra destination entries remain untouched.
+
+### Hiding skipped-file history
+
+Use `--hide-skipped` (alias `--do-not-show-skipped`) with verbose mode to omit per-file skip messages while retaining skip totals, copied-file history, refusals, and removal messages. In dry runs it also hides the repetitive per-file entries for existing files awaiting checksum checks; their totals remain in the summary. It does not disable checksum checks or change copying decisions.
 
 ### Preview without copying
 

@@ -32,6 +32,8 @@ with open(os.environ['SSH_LOG'], 'a') as log:
 command = sys.argv[-1]
 if os.environ.get('SLOW_RECEIVER'):
     command = command.replace('target.write(data)', 'time.sleep(0.02); target.write(data)')
+if os.environ.get('MUTATE_SOURCE'):
+    command = command.replace('send(stream, status)', 'open(os.environ["MUTATE_SOURCE"], "wb").close(); send(stream, status)')
 if os.environ.get('NO_HASH'):
     command = command.replace('h = hashlib.sha256()', 'raise RuntimeError("Unexpected hashing")')
 if os.environ.get('CORRUPT_RECEIVER'):
@@ -189,14 +191,92 @@ os.execl('/bin/sh', 'sh', '-c', 'exec ' + command)
         self.assertIn('Total: 2 copied', result.stderr)
         self.assertNotIn('\033', result.stderr)
 
+    def test_sync_prunes_top_level_subtrees_and_nested_extras(self):
+        (self.source / 'keep' / 'empty').mkdir(parents=True)
+        (self.source / 'keep' / 'file').write_bytes(b'keep')
+        (self.dest / 'keep').mkdir()
+        (self.dest / 'keep' / 'extra').write_bytes(b'extra')
+        (self.dest / 'obsolete' / 'deep').mkdir(parents=True)
+        (self.dest / 'obsolete' / 'deep' / 'file').write_bytes(b'extra')
+        outside = self.root / 'outside'
+        outside.mkdir()
+        (outside / 'untouched').write_bytes(b'keep')
+        (self.dest / 'link').symlink_to(outside, target_is_directory=True)
+        result = self.run_copy('--sync')
+        self.assertFalse((self.dest / 'obsolete').exists())
+        self.assertFalse((self.dest / 'keep' / 'extra').exists())
+        self.assertFalse((self.dest / 'link').exists())
+        self.assertEqual((outside / 'untouched').read_bytes(), b'keep')
+        self.assertTrue((self.dest / 'keep' / 'empty').is_dir())
+        self.assertTrue((self.dest / '.nc-wire-state').is_dir())
+        self.assertIn('Sync removed 3 destination-only entries', result.stdout)
+
+    def test_sync_dry_run_lists_removals_without_changes(self):
+        (self.dest / 'obsolete' / 'deep').mkdir(parents=True)
+        (self.dest / 'obsolete' / 'deep' / 'file').write_bytes(b'keep during preview')
+        result = self.run_copy('--sync', '--dry-run')
+        self.assertIn("Would remove directory and all contents: 'obsolete'", result.stdout)
+        self.assertEqual((self.dest / 'obsolete' / 'deep' / 'file').read_bytes(), b'keep during preview')
+        self.assertFalse((self.dest / '.nc-wire-state').exists())
+
+    def test_sync_refusal_prevents_any_deletion(self):
+        (self.source / 'file').write_bytes(b'new')
+        (self.dest / 'file').write_bytes(b'old')
+        (self.dest / 'extra').write_bytes(b'keep')
+        result = self.run_copy('--sync', success=False)
+        self.assertIn('Deletion skipped', result.stdout)
+        self.assertTrue((self.dest / 'extra').exists())
+
+    def test_sync_source_scan_failure_prevents_deletion(self):
+        (self.source / 'unsupported').symlink_to('/etc/passwd')
+        (self.dest / 'extra').write_bytes(b'keep')
+        self.run_copy('--sync', success=False)
+        self.assertTrue((self.dest / 'extra').exists())
+
+    def test_sync_source_changed_after_manifest_prevents_deletion(self):
+        (self.source / 'file').write_bytes(b'copy')
+        (self.dest / 'extra').write_bytes(b'keep')
+        self.env['MUTATE_SOURCE'] = str(self.source / 'added-during-transfer')
+        result = self.run_copy('--sync', success=False)
+        self.assertIn('Source tree changed or copy incomplete', result.stderr)
+        self.assertEqual((self.dest / 'extra').read_bytes(), b'keep')
+
+    def test_sync_requires_directory_mode(self):
+        result = subprocess.run(['bash', str(SCRIPT), '--sync', '--dry-run', '-i', 'localhost',
+                                 '-s', 'mock', '-d', str(self.dest), str(self.source)],
+                                capture_output=True, text=True)
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn('--sync requires directory mode', result.stdout)
+
+    def test_sync_empty_source_removes_only_user_entries(self):
+        (self.dest / 'extra').write_bytes(b'delete')
+        self.run_copy('--sync')
+        self.assertEqual([p.name for p in self.dest.iterdir()], ['.nc-wire-state'])
+
+    def test_hide_skipped_keeps_counts_and_copy_history(self):
+        (self.source / 'same').write_bytes(b'same')
+        (self.dest / 'same').write_bytes(b'same')
+        (self.source / 'new').write_bytes(b'new')
+        result = self.run_copy('-v', '--hide-skipped')
+        self.assertNotIn('Skipped (', result.stderr)
+        self.assertIn("Sent: 'new'", result.stderr)
+        self.assertIn('1 verified/skipped', result.stdout)
+        result = self.run_copy('-v', '--dry-run', '--hide-skipped')
+        self.assertNotIn('Would check:', result.stdout)
+        self.assertIn('2 files already present', result.stdout)
+        result = self.run_copy('-v', '--dry-run', '--check-size-only', '--hide-skipped')
+        self.assertNotIn('Would skip:', result.stdout)
+        self.assertIn('2 size-matched files will be skipped', result.stdout)
+
     def test_cancel_then_retry(self):
         (self.source / 'a-small').write_bytes(b'complete')
         (self.source / 'later' / 'empty-child').mkdir(parents=True)
         with (self.source / 'b-large').open('wb') as stream:
             for _ in range(64):
                 stream.write(b'x' * 1024 * 1024)
+        (self.dest / 'extra-to-delete').write_bytes(b'preserve until successful retry')
         env = dict(self.env, SLOW_RECEIVER='1')
-        process = subprocess.Popen(self.command(), env=env, stdout=subprocess.PIPE,
+        process = subprocess.Popen(self.command('--sync'), env=env, stdout=subprocess.PIPE,
                                    stderr=subprocess.PIPE, text=True, start_new_session=True)
         try:
             deadline = time.monotonic() + 15
@@ -219,11 +299,13 @@ os.execl('/bin/sh', 'sh', '-c', 'exec ' + command)
             self.assertNotEqual(process.returncode, 0)
             self.assertEqual((self.dest / 'a-small').read_bytes(), b'complete')
             self.assertFalse((self.dest / 'b-large').exists())
+            self.assertTrue((self.dest / 'extra-to-delete').exists())
         finally:
             if process.poll() is None:
                 os.killpg(process.pid, signal.SIGKILL)
                 process.communicate()
-        result = self.run_copy()
+        result = self.run_copy('--sync')
+        self.assertFalse((self.dest / 'extra-to-delete').exists())
         self.assertIn('1 copied, 1 verified/skipped', result.stdout)
         self.assertTrue((self.dest / 'later' / 'empty-child').is_dir())
         self.assertEqual((self.source / 'b-large').read_bytes(), (self.dest / 'b-large').read_bytes())
