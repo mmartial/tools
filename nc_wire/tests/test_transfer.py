@@ -10,7 +10,7 @@ SCRIPT = Path(__file__).resolve().parents[1] / 'nc_wire.sh'
 
 
 class TransferTests(unittest.TestCase):
-    def run_transfer(self, failure='', count=1, port=None, existing=None, force=False, verify=True, partial=None, empty=False):
+    def run_transfer(self, failure='', count=1, port=None, existing=None, force=False, verify=True, partial=None, empty=False, options=()):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             sources = [root / ("source ' $special " + str(i)) for i in range(count)]
@@ -22,7 +22,7 @@ class TransferTests(unittest.TestCase):
             destination.mkdir()
             if existing:
                 for source in sources:
-                    (destination / source.name).write_bytes(source.read_bytes() if existing == 'same' else b'old content')
+                    (destination / source.name).write_bytes(source.read_bytes() if existing == 'same' else b'X' * source.stat().st_size if existing == 'same-size' else b'old content')
             if partial:
                 data = sources[0].read_bytes()
                 chunk = 64 * 1024 * 1024
@@ -36,7 +36,8 @@ class TransferTests(unittest.TestCase):
             binaries = root / 'bin'
             binaries.mkdir()
             mocks = {
-                'pv': 'python3 -c \'import sys,os; d=sys.stdin.buffer.read(); open(os.environ["TEST_ROOT"]+"/transferred","ab").write(d); sys.stdout.buffer.write(d)\'\n[ "$FAILURE" != pv ]',
+                'pv': 'echo "Unexpected pv invocation" >&2; exit 99',
+                'sha256sum': "python3 -c 'import sys,hashlib,os; open(os.environ[\"TEST_ROOT\"]+\"/hash-calls\",\"a\").write(\"hash\\n\"); print(hashlib.sha256(sys.stdin.buffer.read()).hexdigest())'",
                 'nc': 'echo "Unexpected netcat invocation" >&2; exit 99',
                 'ssh': '''exec python3 - "$@" <<'MOCK'
 import os, subprocess, sys
@@ -44,6 +45,7 @@ args = sys.argv[1:]
 if args[0] in ('-n', '-q'):
     args.pop(0)
 command = args[1]
+command = command.replace('stream.write(data)', 'stream.write(data); open(os.environ["TEST_ROOT"] + "/transferred", "ab").write(data)')
 failure = os.environ['FAILURE']
 if failure == 'receiver':
     command = command.replace('stream.write(data)', 'raise RuntimeError("Injected receiver failure")')
@@ -68,12 +70,22 @@ MOCK''',
                 port = occupied.getsockname()[1]
             result = subprocess.run(
                 ['bash', str(SCRIPT), '-i', ('invalid address' if failure == 'sender' else '127.0.0.1'), '-s', 'mock',
-                 '-d', str(destination), *(['-f'] if force else []), *(['-p', str(port)] if port is not None else []), *map(str, sources)],
+                 '-d', str(destination), *options, *(['-f'] if force else []), *(['-p', str(port)] if port is not None else []), *map(str, sources)],
                 env=dict(os.environ, PATH=str(binaries) + ':' + os.environ['PATH'],
                          TEST_ROOT=str(root), FAILURE=failure),
                 capture_output=True, text=True, timeout=15,
             )
             occupied.close()
+            if '--use-sha256sum' not in options:
+                self.assertFalse((root / 'hash-calls').exists())
+            elif '--check-size-only' not in options:
+                self.assertTrue((root / 'hash-calls').exists())
+            if existing == 'same-size':
+                self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+                self.assertIn('size matches; contents not verified', result.stdout)
+                self.assertEqual((destination / sources[0].name).read_bytes(), b'X' * sources[0].stat().st_size)
+                self.assertFalse((root / 'hash-calls').exists())
+                return result.stdout
             if existing == 'different' and force and partial:
                 self.assertNotEqual(result.returncode, 0)
                 self.assertIn('Both final and .part exist', result.stderr)
@@ -93,7 +105,7 @@ MOCK''',
                     self.assertEqual(source.read_bytes(), (destination / source.name).read_bytes())
                 if existing == 'same':
                     self.assertFalse((root / 'ports').exists())
-                    self.assertEqual(result.stdout.count('SHA256 matches'), count)
+                    self.assertEqual(result.stdout.count('size matches' if '--check-size-only' in options else 'SHA256 matches'), count)
                     return result.stdout
                 if empty:
                     self.assertFalse((root / 'ports').exists())
@@ -121,6 +133,21 @@ MOCK''',
                     self.assertTrue((destination / (sources[0].name + '.part')).exists())
             return result.stdout
 
+    def test_external_whole_file_hashing(self):
+        self.run_transfer(options=('--use-sha256sum',))
+
+    def test_size_only_skips_without_hashing(self):
+        self.run_transfer(existing='same', options=('--check-size-only',))
+
+    def test_size_only_skips_same_size_different_contents(self):
+        self.run_transfer(existing='same-size', options=('--check-size-only', '--use-sha256sum'))
+
+    def test_size_only_keeps_chunk_resume(self):
+        self.run_transfer(partial='tail', options=('--check-size-only',))
+
+    def test_size_only_rejects_bad_partial_chunk(self):
+        self.run_transfer(partial='bad_first', options=('--check-size-only',))
+
     def test_empty_file(self):
         self.run_transfer(empty=True)
 
@@ -146,7 +173,7 @@ MOCK''',
         self.run_transfer(count=3)
 
     def test_failures_are_reported(self):
-        for failure, message in [('pv', 'Sender failed'), ('sender', 'Sender failed'),
+        for failure, message in [('sender', 'Sender failed'),
                                  ('receiver', 'failed'),
                                  ('checksum', 'Verification failed'),
                                  ('occupied', 'Receiver failed to become ready')]:

@@ -6,7 +6,7 @@ Copy files or a directory tree sequentially to a remote folder using SSH for con
 
 ## Prerequisites
 
-- Local: `ssh` and `python3`; individual-file mode also requires `pv` and `sha256sum`.
+- Local: Bash, `ssh`, and `python3`. No `pv` or `sha256sum` is required by default.
 - Remote: `python3`.
 - SSH access to the destination and an existing writable destination folder.
 - TCP ports 49152–65535 on the destination must be reachable from the sender by default, or allow the specific port supplied with `-p`.
@@ -45,6 +45,26 @@ nc_wire -r -i 10.11.12.15 -s user@nas -d /volume1/backup /local/source
 
 Directory mode uses one SSH session to start a persistent Python receiver and one raw TCP connection for the whole tree. Control messages and binary data use separate typed, length-prefixed frames with exact reads and complete socket writes. Entries are processed in batches of 128, with sequential file writes and SHA256 calculated while streaming new files. It avoids per-file SSH startup and a second full read of newly copied files. A live progress line shows receiver-confirmed copied files, folders ready, verified/skipped and refused files, total bytes sent, overall average speed (`avg`), and the current file with bytes/size, percentage, and its own average speed (`file`). The overall average includes connection setup and verification time; file speed measures bytes handed to the sender transport since that file started, and resets for each file. It refreshes five times per second in a terminal, or every five seconds when redirected to a log. During retry checks it shows the verification phase. Counts of copied files advance when each batch is acknowledged; folders ready counts receiver-confirmed created or existing source subdirectories after each batch, excluding the destination root. `-p` selects a fixed port for the session; otherwise the receiver reserves a random port. The data connection uses IPv4 and is unencrypted, like individual-file mode.
 
+### Preview without copying
+
+Add `--dry-run` to inspect what a command would do. It works with directory mode or an individual file list:
+
+```bash
+nc_wire -r --dry-run -i 10.11.12.15 -s user@nas -d /volume1/backup /local/source
+```
+
+The preview uses a single SSH session and reads file metadata only. It does not hash file contents, open a data listener, create directories or transfer state, or modify existing files or partial transfers. The destination root must already exist and be writable, as for an actual copy.
+
+It reports missing files to copy, missing folders to create, existing same-size files that need checksum checks on the actual run, size mismatches that would be replaced with `-f` or refused without it, and path/type conflicts. With `--skip-verify`, same-size files are reported as skips instead. `-v` lists individual planned actions. Known refusals or conflicts return a nonzero exit status.
+
+The preview cannot determine content equality from size alone. Its copy-byte total counts full sizes of files known to need copying; it excludes decisions pending checksum checks and does not estimate partial-prefix reuse. A real run checks the filesystem again.
+
+### Verbose two-line status
+
+With `-v`, terminal progress uses two live rows: the current filename, progress bar, size/percentage, recent speed (`now`, sampled over roughly two seconds), and per-file average (`avg`) on the first row; global counts, bytes and average speed on the second. The saved `Sent` line includes the final per-file average speed. Rates measure sender-side progress, not durable NAS writes; recent speed drops to zero during a stall. Narrow terminals shorten paths and may omit byte sizes to keep the bar and rates visible. Python renders the display directly; neither transfer mode needs `pv`. When a file has been sent, its status remains in the terminal history and the next file takes over the live row. Skipped and refused files also get history entries.
+
+A sent file is labeled **awaiting batch verification** until the receiver acknowledges its batch; a separate confirmation entry then records the batch's copied count. This retains batched transfer throughput without treating unconfirmed sends as completed copies. Redirected output uses ordinary lines without cursor movement. Without `-v`, the compact single-line display remains available. Verbose mode emits one history entry per file, so large trees produce large logs.
+
 ### Optional colors
 
 Add `--color` to enable colored progress and status output, for example:
@@ -64,6 +84,16 @@ An incomplete file is kept separately under the reserved destination directory `
 If an existing file differs, the command reports it, continues with other files, and exits nonzero. Use `-f` to replace differing files; directory mode keeps the old file until its verified replacement is ready. Files corrupted by an interrupted machine or disk write are detected on retry and also require `-f` to replace.
 
 Writes are buffered by the operating system; directory mode does not force a disk sync for every file. Completion means data was received, hashed, and written successfully, not a power-loss durability guarantee. Retrying checks actual file contents rather than trusting saved completion records.
+
+### Hashing options in both modes
+
+Python SHA256 is the default. Add `--use-sha256sum` to use an installed `sha256sum` for whole-file hashes on the local and remote hosts. The override covers existing-file comparisons, single-file source hashing, and single-file final verification. Chunk hashing and directory streaming checksums remain in Python; the external command is not started for each chunk. A required external hashing command that is missing or fails stops the transfer rather than silently falling back. Dry runs never hash files.
+
+Add `--check-size-only` to skip an existing completed file when its size matches the source, without hashing either file. This applies to individual-file and directory modes and works with `--dry-run`. Matching-size contents can differ or be corrupt; use the default checksum comparison when content equality matters.
+
+For individual-file mode, a differing size follows the normal `-f` overwrite rules. Existing `.part` files and forced replacements still undergo the same 64 MiB chunk hash checks before resuming. Newly transferred files still receive full SHA256 verification before publication. Directory mode retains its existing size-only restart behavior and retransmits interrupted files from the beginning. `--skip-verify` remains a directory-only alias for size-only checks.
+
+Individual-file progress is now rendered by the Python sender: a bar, percentage, total bytes including the resumed prefix, and average speed for bytes sent during this attempt. It seeks directly to the verified resume offset without a `pv` pipeline.
 
 ### Faster retries with size-only checks
 

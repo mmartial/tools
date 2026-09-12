@@ -83,6 +83,26 @@ os.execl('/bin/sh', 'sh', '-c', 'exec ' + command)
         self.run_copy('-f')
         self.assertEqual((self.dest / 'file').read_bytes(), b'correct')
 
+    def test_check_size_only_alias(self):
+        (self.source / 'file').write_bytes(b'abc')
+        (self.dest / 'file').write_bytes(b'xyz')
+        self.env['NO_HASH'] = '1'
+        result = self.run_copy('--check-size-only')
+        self.assertIn('1 size-matched/skipped', result.stdout)
+        self.assertEqual((self.dest / 'file').read_bytes(), b'xyz')
+
+    def test_directory_external_hash_override(self):
+        (self.source / 'file').write_bytes(b'abc')
+        (self.dest / 'file').write_bytes(b'abc')
+        executable = self.root / 'bin' / 'sha256sum'
+        executable.write_text("#!/usr/bin/env python3\nimport hashlib,sys,os\nwith open(os.environ['HASH_LOG'], 'a') as log: log.write('hash\\n')\nprint(hashlib.sha256(sys.stdin.buffer.read()).hexdigest())\n")
+        executable.chmod(0o755)
+        self.env['HASH_LOG'] = str(self.root / 'hash.log')
+        self.env['NO_HASH'] = '1'
+        result = self.run_copy('--use-sha256sum')
+        self.assertIn('1 verified/skipped', result.stdout)
+        self.assertEqual((self.root / 'hash.log').read_text().splitlines(), ['hash', 'hash'])
+
     def test_skip_verify_uses_size_and_reports_unverified_skips(self):
         (self.source / 'file').write_bytes(b'correct')
         (self.dest / 'file').write_bytes(b'changed')
@@ -114,6 +134,60 @@ os.execl('/bin/sh', 'sh', '-c', 'exec ' + command)
                                 capture_output=True, text=True)
         self.assertNotEqual(result.returncode, 0)
         self.assertIn('requires directory mode', result.stdout)
+
+    def test_dry_run_is_read_only_and_does_not_hash(self):
+        (self.source / 'nested').mkdir()
+        (self.source / 'nested' / 'new').write_bytes(b'new')
+        (self.source / 'same').write_bytes(b'abc')
+        (self.source / 'different').write_bytes(b'long')
+        (self.dest / 'same').write_bytes(b'xyz')
+        (self.dest / 'different').write_bytes(b'x')
+        state = self.dest / '.nc-wire-state'
+        state.mkdir()
+        (state / 'incoming').write_bytes(b'partial retained')
+        before = {str(p.relative_to(self.dest)): p.read_bytes() for p in self.dest.rglob('*') if p.is_file()}
+        self.env['NO_HASH'] = '1'
+        result = self.run_copy('--dry-run', success=False)
+        self.assertIn('will copy 1 files', result.stdout)
+        self.assertIn('create 1 folders', result.stdout)
+        self.assertIn('1 files already present, will check checksums', result.stdout)
+        self.assertIn('1 files would be refused', result.stdout)
+        self.assertFalse((self.dest / 'nested').exists())
+        after = {str(p.relative_to(self.dest)): p.read_bytes() for p in self.dest.rglob('*') if p.is_file()}
+        self.assertEqual(before, after)
+        result = self.run_copy('--dry-run', '--skip-verify', '-f')
+        self.assertIn('will copy 2 files', result.stdout)
+        self.assertIn('1 size-matched files will be skipped', result.stdout)
+
+    def test_dry_run_never_creates_state_or_binds_data_port(self):
+        (self.source / 'empty').mkdir()
+        with socket.socket() as listener:
+            listener.bind(('', 0))
+            listener.listen()
+            self.run_copy('--dry-run', '-p', str(listener.getsockname()[1]))
+        self.assertEqual(list(self.dest.iterdir()), [])
+
+    def test_dry_run_individual_files(self):
+        source = self.source / 'file & spaces'
+        source.write_bytes(b'hello')
+        result = subprocess.run(['bash', str(SCRIPT), '--dry-run', '-i', '127.0.0.1',
+                                 '-s', 'mock', '-d', str(self.dest), str(source)],
+                                env=self.env, capture_output=True, text=True, timeout=10)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn('will copy 1 files', result.stdout)
+        self.assertEqual(list(self.dest.iterdir()), [])
+
+    def test_verbose_keeps_file_history(self):
+        (self.source / 'one').write_bytes(b'1')
+        (self.source / 'two').write_bytes(b'22')
+        result = self.run_copy('-v')
+        self.assertIn("Sent: 'one'", result.stderr)
+        self.assertIn("Sent: 'two'", result.stderr)
+        sent_lines = [line for line in result.stderr.splitlines() if line.startswith('Sent:')]
+        self.assertTrue(all('avg:' in line and '100%' in line for line in sent_lines))
+        self.assertIn('Receiver confirmed 2 copied files', result.stderr)
+        self.assertIn('Total: 2 copied', result.stderr)
+        self.assertNotIn('\033', result.stderr)
 
     def test_cancel_then_retry(self):
         (self.source / 'a-small').write_bytes(b'complete')
@@ -230,6 +304,65 @@ class ProgressTests(unittest.TestCase):
             self.assertIn('file: 0 B/s', progress.line())
             progress.current = ('Verifying', 'next', 0, 100)
             self.assertNotIn(' | file:', progress.line())
+
+    def test_verbose_terminal_uses_two_rows_and_keeps_history(self):
+        from unittest.mock import patch
+        source = SCRIPT.read_text().split("DIRECTORY_HELPER=$(cat <<'DIRECTORY_PY'\n", 1)[1].split('\nDIRECTORY_PY', 1)[0]
+        namespace = {'__name__': 'verbose_test'}
+        exec(compile(source, str(SCRIPT), 'exec'), namespace)
+        progress = namespace['Progress'](verbose=True)
+        progress.tty = True
+        progress.current = ('Copying', 'first', 5, 10)
+        with patch('sys.stderr', new_callable=io.StringIO) as output:
+            progress.render()
+            self.assertIn("Copying 'first'", output.getvalue())
+            self.assertIn('\nTotal:', output.getvalue())
+            progress.record("Sent: 'first'")
+            progress.current = ('Copying', 'second', 0, 10)
+            progress.render()
+            self.assertEqual(output.getvalue().count("Sent: 'first'"), 1)
+            self.assertIn('\033[1A', output.getvalue())
+            self.assertIn("Copying 'second'", output.getvalue())
+
+    def test_bar_recent_rate_final_average_and_reset(self):
+        from unittest.mock import patch
+        source = SCRIPT.read_text().split("DIRECTORY_HELPER=$(cat <<'DIRECTORY_PY'\n", 1)[1].split('\nDIRECTORY_PY', 1)[0]
+        namespace = {'__name__': 'file_rate_test'}
+        exec(compile(source, str(SCRIPT), 'exec'), namespace)
+        progress = namespace['Progress'](verbose=True)
+        mb = 1024 * 1024
+        with patch('time.monotonic', return_value=10):
+            progress.start_file('large', 100 * mb)
+        with patch('time.monotonic', return_value=11):
+            progress.advance_file('large', 50 * mb, 100 * mb)
+            line = progress.file_line()
+            self.assertIn('[######------]', line)
+            self.assertIn('now: 50.0 MiB/s', line)
+            self.assertIn('avg: 50.0 MiB/s', line)
+        with patch('time.monotonic', return_value=14):
+            self.assertIn('now: 0 B/s', progress.file_line())
+        with patch('time.monotonic', return_value=15):
+            progress.advance_file('large', 100 * mb, 100 * mb)
+            self.assertIn('avg: 20.0 MiB/s', progress.sent_line('large', 100 * mb))
+            progress.start_file('empty', 0)
+            self.assertIn('[############]', progress.file_line())
+            self.assertIn('now: 0 B/s', progress.file_line())
+
+    def test_long_name_keeps_bar_and_speeds_visible(self):
+        from unittest.mock import patch
+        source = SCRIPT.read_text().split("DIRECTORY_HELPER=$(cat <<'DIRECTORY_PY'\n", 1)[1].split('\nDIRECTORY_PY', 1)[0]
+        namespace = {'__name__': 'width_test'}
+        exec(compile(source, str(SCRIPT), 'exec'), namespace)
+        progress = namespace['Progress'](verbose=True)
+        progress.tty = True
+        progress.start_file('folder/' * 60, 100)
+        progress.advance_file('folder/' * 60, 50, 100)
+        with patch('shutil.get_terminal_size', return_value=os.terminal_size((100, 24))):
+            line = progress.file_line()
+            self.assertLessEqual(len(line), 99)
+            self.assertIn('[######------]', line)
+            self.assertIn('now:', line)
+            self.assertIn('avg:', line)
 
     def test_color_is_opt_in_and_respects_terminal_and_no_color(self):
         from unittest.mock import patch
