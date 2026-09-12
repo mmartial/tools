@@ -15,25 +15,39 @@ error_exit() { echo "$1"; exit 1; }
 
 is_installed() { if ! command -v "$1" >/dev/null 2>&1; then error_exit "$1 is not installed. Please install it first."; fi; }
 
-vprint() { if [ "$VERBOSE" = true ]; then echo "$1"; fi; }
+vprint() {
+    if [ "$VERBOSE" = true ]; then
+        if [ "$COLOR" = true ] && [ -t 1 ] && [ -z "${NO_COLOR+x}" ] && [ "${TERM:-}" != dumb ]; then
+            printf '\033[36m%s\033[0m\n' "$1"
+        else
+            printf '%s\n' "$1"
+        fi
+    fi
+}
 
 # Quote a value for the remote POSIX shell, including embedded apostrophes.
 shell_quote() { local value=${1//\'/\'\\\'\'}; printf "'%s'" "$value"; }
 
 help() {
-    echo "Usage: $0 [-v] [-f] [-p <port>] -i <ip> -s <ssh> -d <folder> [--] <file> [file ...]"
+    echo "Usage: $0 [-r] [-v] [--color] [-f] [-p <port>] -i <ip> -s <ssh> -d <folder> [--] <file> [file ...]"
     echo "Copies files sequentially to one remote folder using SSH and Python TCP sockets."
     echo "  -i <ip>     Destination IP for the data connection"
     echo "  -s <ssh>    SSH destination (user@host or SSH config alias)"
     echo "  -d <folder> Existing writable destination folder"
     echo "  -p <port>   Optional fixed destination port (default: random)"
+    echo "  -r          Copy one source directory’s contents, preserving relative paths"
     echo "  -f          Force overwrite of differing files; identical files are skipped"
     echo "  -v          Verbose output, including selected ports"
+    echo "  --skip-verify  Directory mode: skip existing files with matching sizes, without SHA256"
+    echo "  --color     Enable terminal colors (plain when redirected or NO_COLOR is set)"
     echo "  -h          Show help"
     echo "By default, a random free remote port in 49152-65535 is selected for each file."
     echo "Example: $0 -i 10.0.0.13 -s motoko -d /4TB ~/Downloads/*.safetensors"
 }
 
+SKIP_VERIFY=false
+COLOR=false
+DIRECTORY=false
 FORCE=false
 VERBOSE=false
 FIXED_PORT=""
@@ -54,8 +68,11 @@ while [ "$#" -gt 0 ]; do
                     ;;
             esac
             shift 2 ;;
+        -r|--recursive) DIRECTORY=true; shift ;;
         -f) FORCE=true; shift ;;
         -v) VERBOSE=true; shift ;;
+        --color) COLOR=true; shift ;;
+        --skip-verify) SKIP_VERIFY=true; shift ;;
         -h|--help) help; exit 0 ;;
         --) shift; FILES+=("$@"); break ;;
         -*) error_exit "nc_wire: Unknown option $1. Use -h for usage; files are positional." ;;
@@ -65,6 +82,475 @@ done
 if [ "${#FILES[@]}" -eq 0 ] || [ -z "$DEST_IP" ] || [ -z "$DEST_SSH" ] || [ -z "$DEST_FOLDER" ]; then
     help
     exit 1
+fi
+
+if [ "$SKIP_VERIFY" = true ] && [ "$DIRECTORY" != true ]; then
+    error_exit "nc_wire: --skip-verify requires directory mode (-r)."
+fi
+
+if [ "$DIRECTORY" = true ]; then
+    [ "${#FILES[@]}" -eq 1 ] || error_exit "nc_wire: Directory mode requires exactly one source directory."
+    is_installed python3
+    is_installed ssh
+    DIRECTORY_HELPER=$(cat <<'DIRECTORY_PY'
+"""Persistent directory transport; embedded in nc_wire.sh for single-file installs."""
+import fcntl
+import hashlib
+import json
+import os
+import random
+import select
+import shlex
+import signal
+import socket
+import stat
+import subprocess
+import sys
+import time
+import threading
+import struct
+import shutil
+
+BLOCK = 1024 * 1024
+BATCH = 128
+STATE = '.nc-wire-state'
+
+
+class Wire:
+    """Typed, length-prefixed frames with explicit exact reads and sendall writes.
+
+    Buffer small frames together without relying on a mixed read/write file object.
+    Never flush queued data during exception cleanup (which could mask the cause).
+    """
+    HEADER = struct.Struct('!cI')
+    MAX_FRAME = 4 * BLOCK
+
+    def __init__(self, connection):
+        self.connection = connection
+        self.pending = bytearray()
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *args):
+        self.pending.clear()
+
+    def flush(self):
+        if self.pending:
+            self.connection.sendall(self.pending)
+            self.pending.clear()
+
+    def write_frame(self, kind, data):
+        if len(data) > self.MAX_FRAME:
+            raise RuntimeError('Protocol frame exceeds size limit')
+        self.pending.extend(self.HEADER.pack(kind, len(data)))
+        self.pending.extend(data)
+        if len(self.pending) >= BLOCK:
+            self.flush()
+
+    def exact(self, length):
+        data = bytearray()
+        while len(data) < length:
+            chunk = self.connection.recv(length - len(data))
+            if not chunk:
+                raise RuntimeError('Connection ended mid-frame (%d/%d bytes)' % (len(data), length))
+            data.extend(chunk)
+        return bytes(data)
+
+    def read_frame(self, expected):
+        kind, length = self.HEADER.unpack(self.exact(self.HEADER.size))
+        if kind != expected or length > self.MAX_FRAME:
+            raise RuntimeError('Invalid protocol frame: expected %r, received %r, length %d' %
+                               (expected, kind, length))
+        return self.exact(length)
+
+
+def send(stream, value, flush=True):
+    stream.write_frame(b'J', json.dumps(value, ensure_ascii=True).encode('ascii'))
+    if flush:
+        stream.flush()
+
+
+def receive(stream):
+    try:
+        value = json.loads(stream.read_frame(b'J'))
+    except (UnicodeError, ValueError) as exc:
+        raise RuntimeError('Invalid JSON control frame: ' + str(exc))
+    if isinstance(value, dict) and 'error' in value:
+        raise RuntimeError(value['error'])
+    return value
+
+
+def digest(path):
+    h = hashlib.sha256()
+    with open(path, 'rb') as stream:
+        for data in iter(lambda: stream.read(BLOCK), b''):
+            h.update(data)
+    return h.hexdigest()
+
+
+def signature(info):
+    return info.st_dev, info.st_ino, info.st_size, info.st_mtime_ns, info.st_ctime_ns
+
+
+def checked_path(root, relative, directory=False, create=True):
+    parts = relative.split('/')
+    if not relative or any(p in ('', '.', '..') for p in parts) or parts[0] == STATE:
+        raise RuntimeError('Unsafe or reserved relative path: ' + repr(relative))
+    current = root
+    for index, part in enumerate(parts):
+        current = os.path.join(current, part)
+        is_dir = index < len(parts) - 1 or directory
+        if is_dir and create:
+            try:
+                os.mkdir(current)
+            except FileExistsError:
+                pass
+        if os.path.lexists(current):
+            mode = os.lstat(current).st_mode
+            if not (stat.S_ISDIR(mode) if is_dir else stat.S_ISREG(mode)):
+                raise RuntimeError('Destination type conflict: ' + current)
+    return current
+
+
+def entries(root):
+    def failed(exc):
+        raise exc
+    for folder, dirs, files in os.walk(root, followlinks=False, onerror=failed):
+        dirs.sort()
+        files.sort()
+        # Announce a directory only on entering it, not while listing siblings.
+        if folder != root:
+            yield {'path': os.path.relpath(folder, root), 'kind': 'dir'}
+        for name in dirs + files:
+            path = os.path.join(folder, name)
+            relative = os.path.relpath(path, root)
+            if relative.split(os.sep)[0] == STATE:
+                raise RuntimeError('Reserved source name: ' + STATE)
+            info = os.lstat(path)
+            if stat.S_ISDIR(info.st_mode):
+                continue
+            elif stat.S_ISREG(info.st_mode):
+                yield {'path': relative, 'kind': 'file', 'size': info.st_size,
+                       'mtime_ns': info.st_mtime_ns, 'signature': signature(info)}
+            else:
+                raise RuntimeError('Unsupported source type (symlink or special file): ' + path)
+
+
+def server(root, port, force, skip_verify):
+    if not os.path.isdir(root) or not os.access(root, os.W_OK):
+        raise RuntimeError('Destination folder must exist and be writable: ' + root)
+    root = os.path.realpath(root)
+    state = os.path.join(root, STATE)
+    try:
+        os.mkdir(state, 0o700)
+    except FileExistsError:
+        pass
+    if not stat.S_ISDIR(os.lstat(state).st_mode):
+        raise RuntimeError('Unsafe transfer state directory')
+    lock = os.open(os.path.join(state, 'lock'), os.O_CREAT | os.O_RDWR | os.O_NOFOLLOW, 0o600)
+    with os.fdopen(lock, 'r+b') as lockfile:
+        fcntl.flock(lockfile, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        incoming = os.path.join(state, 'incoming')
+        if os.path.lexists(incoming) and not stat.S_ISREG(os.lstat(incoming).st_mode):
+            raise RuntimeError('Unsafe incoming temporary file')
+        # An interrupted file is retransmitted; completed files are hash-checked.
+        if os.path.exists(incoming):
+            os.unlink(incoming)
+        token = os.urandom(32).hex()
+        with socket.socket() as listener:
+            listener.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+            for attempt in range(100):
+                selected = int(port) if port else random.SystemRandom().randrange(49152, 65536)
+                try:
+                    listener.bind(('', selected))
+                    break
+                except OSError:
+                    if port or attempt == 99:
+                        raise
+            listener.listen(1)
+            listener.settimeout(30)
+            print(json.dumps({'port': selected, 'token': token}), flush=True)
+            connection, _ = listener.accept()
+            with connection:
+                connection.settimeout(30)
+                with Wire(connection) as stream:
+                    if receive(stream) != {'token': token}:
+                        raise RuntimeError('Invalid transfer token')
+                    connection.settimeout(None)
+                    while True:
+                        batch = receive(stream)
+                        if batch == {'done': True}:
+                            send(stream, {'done': True})
+                            return
+                        if not isinstance(batch, list) or len(batch) > BATCH:
+                            raise RuntimeError('Invalid manifest batch')
+                        paths, status = [], []
+                        for entry in batch:
+                            path = checked_path(root, entry['path'], entry['kind'] == 'dir', create=False)
+                            paths.append(path)
+                            if entry['kind'] == 'dir':
+                                status.append(None)
+                            elif os.path.exists(path):
+                                status.append({'size': os.stat(path).st_size} if skip_verify else {'sha256': digest(path)})
+                            else:
+                                status.append({})
+                        send(stream, status)
+                        for entry, path, old in zip(batch, paths, status):
+                            action = receive(stream)
+                            if entry['kind'] == 'dir':
+                                if action != {'action': 'mkdir'}:
+                                    raise RuntimeError('Expected directory creation action')
+                                checked_path(root, entry['path'], directory=True)
+                                continue
+                            if action['action'] in ('skip', 'refuse'):
+                                continue
+                            if action['action'] != 'write' or (old and not force):
+                                raise RuntimeError('Overwrite not authorized')
+                            checked_path(root, entry['path'])
+                            remaining = entry['size']
+                            if not isinstance(remaining, int) or remaining < 0:
+                                raise RuntimeError('Invalid file size')
+                            h = hashlib.sha256()
+                            with open(incoming, 'xb') as target:
+                                while remaining:
+                                    data = stream.read_frame(b'D')
+                                    if not data or len(data) > min(BLOCK, remaining):
+                                        raise RuntimeError('Invalid data frame for file: ' + entry['path'])
+                                    target.write(data)
+                                    h.update(data)
+                                    remaining -= len(data)
+                            trailer = receive(stream)
+                            if trailer != {'sha256': h.hexdigest()}:
+                                raise RuntimeError('Checksum mismatch: ' + entry['path'])
+                            os.utime(incoming, ns=(entry['mtime_ns'], entry['mtime_ns']))
+                            # Recheck parent types before publishing. No concurrent writers supported.
+                            checked_path(root, entry['path'])
+                            if force:
+                                os.replace(incoming, path)
+                            else:
+                                os.link(incoming, path)
+                                os.unlink(incoming)
+                        send(stream, {'ok': True})
+
+
+def human_size(size):
+    for unit in ('B', 'KiB', 'MiB', 'GiB', 'TiB'):
+        if size < 1024 or unit == 'TiB':
+            return ('%d %s' if unit == 'B' else '%.1f %s') % (size, unit)
+        size /= 1024.0
+
+
+class Progress:
+    """Render independently of blocking socket writes and remote hash checks."""
+    def __init__(self, color=False):
+        self.skip_label = 'verified/skipped'
+        self.color = color
+        self.folders = self.copied = self.skipped = self.refused = 0
+        self.sent = self.pending = 0
+        self.current = ('Connecting', '', 0, 0)
+        self.started = time.monotonic()
+        self.file_started = self.started
+        self.stop = threading.Event()
+        self.tty = sys.stderr.isatty()
+        self.worker = threading.Thread(target=self.run, daemon=True)
+
+    def paint(self, text, code, output=None):
+        output = sys.stderr if output is None else output
+        if self.color and output.isatty() and 'NO_COLOR' not in os.environ and os.environ.get('TERM') != 'dumb':
+            return '\033[' + code + 'm' + text + '\033[0m'
+        return text
+
+    def line(self):
+        phase, name, position, size = self.current
+        elapsed = max(time.monotonic() - self.started, 0.001)
+        text = ('Copied so far: %d files / %d folders ready | %d verified/skipped | '
+                '%d refused | %s sent' %
+                (self.copied, self.folders, self.skipped, self.refused,
+                 human_size(self.sent)))
+        if self.pending:
+            text += ' | %d awaiting confirmation' % self.pending
+        text += ' | ' + phase
+        if name:
+            # Escape newlines and terminal control characters in filenames.
+            text += ' ' + ascii(name)
+        if phase == 'Copying':
+            percent = 100.0 if size == 0 else min(100.0, position * 100.0 / size)
+            text += ' %s / %s (%.1f%%)' % (human_size(position), human_size(size), percent)
+        text += ' | avg: %s/s' % human_size(self.sent / elapsed)
+        if phase == 'Copying':
+            file_elapsed = max(time.monotonic() - self.file_started, 0.001)
+            text += ' | file: %s/s' % human_size(position / file_elapsed)
+        return text.replace('verified/skipped', self.skip_label, 1)
+
+    def render(self):
+        prefix = '\r\033[2K' if self.tty else ''
+        line = self.line()
+        if self.tty:
+            width = max(10, shutil.get_terminal_size().columns - 1)
+            if len(line) > width:
+                left = (width - 3) // 2
+                line = line[:left] + '...' + line[-(width - left - 3):]
+        # Color after shortening so escape sequences do not count toward width.
+        sections = line.split(' | ')
+        line = ' | '.join(self.paint(section, '32' if index == 0 else '36' if index == len(sections) - 1 else '33' if 'refused' in section or 'awaiting' in section else '37')
+                          for index, section in enumerate(sections))
+        print(prefix + line, end='' if self.tty else '\n', file=sys.stderr, flush=True)
+
+    def run(self):
+        while not self.stop.wait(0.2 if self.tty else 5.0):
+            self.render()
+
+    def finish(self, outcome):
+        self.stop.set()
+        self.worker.join()
+        self.render()
+        if self.tty:
+            print(file=sys.stderr)
+        elapsed = time.monotonic() - self.started
+        summary = ('nc_wire: %s: %d copied, %d verified/skipped, %d refused; '
+              '%d folders ready; %s sent in %.1fs; %d awaiting confirmation.' %
+              (outcome, self.copied, self.skipped, self.refused,
+               self.folders, human_size(self.sent), elapsed, self.pending))
+        code = '32' if outcome == 'Directory complete' and not self.refused else '33'
+        summary = summary.replace('verified/skipped', self.skip_label, 1)
+        print(self.paint(summary, code, sys.stdout), flush=True)
+
+
+def client(code, source, root, host, ip, port, force, verbose, color, skip_verify):
+    if os.path.islink(source) or not os.path.isdir(source):
+        raise RuntimeError('Source must be a directory, not a symlink')
+    source = os.path.abspath(source)
+    command = 'python3 -u -c ' + shlex.quote(code) + ' ' + ' '.join(
+        shlex.quote(x) for x in ('--receiver', root, port, force, skip_verify))
+    process = subprocess.Popen(['ssh', '-T', host, command], stdout=subprocess.PIPE)
+    progress = Progress(color == 'true')
+    progress.skip_label = 'size-matched/skipped' if skip_verify == 'true' else 'verified/skipped'
+    progress.worker.start()
+    outcome = 'Stopped before completion'
+    try:
+        if not select.select([process.stdout], [], [], 60)[0]:
+            raise RuntimeError('Timed out waiting for remote receiver')
+        ready = json.loads(process.stdout.readline(4096))
+        if verbose == 'true':
+            if progress.tty:
+                print('\r\033[2K', end='', file=sys.stderr)
+            print(progress.paint('nc_wire: Receiver ready on port %s' % ready['port'], '36'), file=sys.stderr, flush=True)
+        with socket.create_connection((ip, ready['port']), timeout=30) as connection:
+            connection.settimeout(None)
+            with Wire(connection) as stream:
+                send(stream, {'token': ready['token']})
+                iterator = iter(entries(source))
+                while True:
+                    progress.current = ('Scanning source', '', 0, 0)
+                    batch = []
+                    for _ in range(BATCH):
+                        try:
+                            batch.append(next(iterator))
+                        except StopIteration:
+                            break
+                    if not batch:
+                        break
+                    send(stream, batch)
+                    progress.current = ('Checking destination batch', '', 0, 0)
+                    status = receive(stream)
+                    if not isinstance(status, list) or len(status) != len(batch):
+                        raise RuntimeError('Invalid receiver manifest response')
+                    batch_folders = 0
+                    for entry, old in zip(batch, status):
+                        if entry['kind'] == 'dir':
+                            send(stream, {'action': 'mkdir'}, flush=False)
+                            batch_folders += 1
+                            continue
+                        progress.current = (('Checking size' if skip_verify == 'true' else 'Verifying') if old else 'Preparing', entry['path'], 0, entry['size'])
+                        path = os.path.join(source, entry['path'])
+                        if signature(os.stat(path, follow_symlinks=False)) != tuple(entry['signature']):
+                            raise RuntimeError('Source changed: ' + path)
+                        local_hash = digest(path) if old and skip_verify != 'true' else None
+                        if old and signature(os.stat(path, follow_symlinks=False)) != tuple(entry['signature']):
+                            raise RuntimeError('Source changed while hashing: ' + path)
+                        if old and (old['size'] == entry['size'] if skip_verify == 'true' else local_hash == old['sha256']):
+                            send(stream, {'action': 'skip'}, flush=False)
+                            progress.skipped += 1
+                            continue
+                        if old and force != 'true':
+                            send(stream, {'action': 'refuse'}, flush=False)
+                            progress.refused += 1
+                            print(progress.paint('nc_wire: Refusing differing file (use -f): ' + repr(entry['path']), '33'), file=sys.stderr)
+                            continue
+                        with open(path, 'rb') as source_file:
+                            if signature(os.fstat(source_file.fileno())) != tuple(entry['signature']):
+                                raise RuntimeError('Source changed: ' + path)
+                            send(stream, {'action': 'write'}, flush=False)
+                            h = hashlib.sha256()
+                            remaining = entry['size']
+                            progress.file_started = time.monotonic()
+                            progress.current = ('Copying', entry['path'], 0, entry['size'])
+                            while remaining:
+                                data = source_file.read(min(BLOCK, remaining))
+                                if not data:
+                                    raise RuntimeError('Source shortened: ' + path)
+                                stream.write_frame(b'D', data)
+                                h.update(data)
+                                progress.sent += len(data)
+                                remaining -= len(data)
+                                progress.current = ('Copying', entry['path'], entry['size'] - remaining, entry['size'])
+                            if signature(os.fstat(source_file.fileno())) != tuple(entry['signature']):
+                                raise RuntimeError('Source changed during transfer: ' + path)
+                            send(stream, {'sha256': h.hexdigest()}, flush=False)
+                        progress.pending += 1
+                    progress.current = ('Waiting for receiver verification', '', 0, 0)
+                    stream.flush()
+                    if receive(stream) != {'ok': True}:
+                        raise RuntimeError('Missing batch acknowledgement')
+                    progress.folders += batch_folders
+                    progress.copied += progress.pending
+                    progress.pending = 0
+                send(stream, {'done': True})
+                if receive(stream) != {'done': True}:
+                    raise RuntimeError('Missing completion acknowledgement')
+        if process.wait(timeout=30):
+            raise RuntimeError('Remote receiver failed')
+        outcome = 'Directory complete'
+        progress.current = ('Finished', '', 0, 0)
+        return 1 if progress.refused else 0
+    except KeyboardInterrupt:
+        outcome = 'Cancelled'
+        raise
+    finally:
+        progress.finish(outcome)
+        if process.poll() is None:
+            process.terminate()
+            try:
+                process.wait(timeout=5)
+            except subprocess.TimeoutExpired:
+                process.kill()
+                process.wait()
+        process.stdout.close()
+
+
+def interrupted(signum, frame):
+    raise KeyboardInterrupt
+
+
+if __name__ == '__main__':
+    signal.signal(signal.SIGTERM, interrupted)
+    try:
+        if sys.argv[1] == '--receiver':
+            server(sys.argv[2], sys.argv[3], sys.argv[4] == 'true', sys.argv[5] == 'true')
+            result = 0
+        else:
+            result = client(*sys.argv[1:])
+        sys.exit(result)
+    except KeyboardInterrupt:
+        print('nc_wire: Cancelled. Rerun the same command to verify completed files and retry.', file=sys.stderr)
+        sys.exit(130)
+    except (OSError, RuntimeError, ValueError, KeyError, subprocess.SubprocessError) as exc:
+        print('nc_wire: ' + str(exc), file=sys.stderr)
+        sys.exit(1)
+DIRECTORY_PY
+)
+    exec python3 -c "$DIRECTORY_HELPER" "$DIRECTORY_HELPER" "${FILES[0]}" "$DEST_FOLDER" "$DEST_SSH" "$DEST_IP" "$FIXED_PORT" "$FORCE" "$VERBOSE" "$COLOR" "$SKIP_VERIFY"
 fi
 
 is_installed pv
