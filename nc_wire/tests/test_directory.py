@@ -38,6 +38,8 @@ if os.environ.get('NO_HASH'):
     command = command.replace('h = hashlib.sha256()', 'raise RuntimeError("Unexpected hashing")')
 if os.environ.get('CORRUPT_RECEIVER'):
     command = command.replace('h.update(data)', 'h.update(b"corrupt")')
+if os.environ.get('FORBID_FRESH_WRITE'):
+    command = command.replace("target = open(part, 'xb')", 'raise RuntimeError("Unexpected fresh write")')
 os.execl('/bin/sh', 'sh', '-c', 'exec ' + command)
 ''')
         ssh.chmod(0o755)
@@ -280,7 +282,7 @@ os.execl('/bin/sh', 'sh', '-c', 'exec ' + command)
                                    stderr=subprocess.PIPE, text=True, start_new_session=True)
         try:
             deadline = time.monotonic() + 15
-            incoming = self.dest / '.nc-wire-state' / 'incoming'
+            incoming = self.dest / 'b-large.part'
             while time.monotonic() < deadline:
                 if incoming.exists() and incoming.stat().st_size > 1024 * 1024:
                     break
@@ -309,6 +311,36 @@ os.execl('/bin/sh', 'sh', '-c', 'exec ' + command)
         self.assertIn('1 copied, 1 verified/skipped', result.stdout)
         self.assertTrue((self.dest / 'later' / 'empty-child').is_dir())
         self.assertEqual((self.source / 'b-large').read_bytes(), (self.dest / 'b-large').read_bytes())
+
+    def test_resumes_matching_partial_prefix(self):
+        chunk = 64 * 1024 * 1024
+        payload = (bytes(range(256)) * ((chunk + 4096) // 256 + 1))[:chunk + 4096]
+        (self.source / 'big').write_bytes(payload)
+        (self.dest / 'big.part').write_bytes(payload[:chunk])
+        self.env['FORBID_FRESH_WRITE'] = '1'
+        result = self.run_copy()
+        self.assertIn('1 copied', result.stdout)
+        self.assertEqual((self.dest / 'big').read_bytes(), payload)
+        self.assertFalse((self.dest / 'big.part').exists())
+
+    def test_resume_restarts_on_mismatched_prefix(self):
+        chunk = 64 * 1024 * 1024
+        payload = (bytes(range(256)) * ((chunk + 4096) // 256 + 1))[:chunk + 4096]
+        (self.source / 'big').write_bytes(payload)
+        corrupted = bytearray(payload[:chunk])
+        corrupted[0] ^= 1
+        (self.dest / 'big.part').write_bytes(bytes(corrupted))
+        result = self.run_copy()
+        self.assertIn('1 copied', result.stdout)
+        self.assertEqual((self.dest / 'big').read_bytes(), payload)
+        self.assertFalse((self.dest / 'big.part').exists())
+
+    def test_source_reserved_part_sibling_rejected(self):
+        (self.source / 'model.bin').write_bytes(b'data')
+        (self.source / 'model.bin.part').write_bytes(b'other')
+        result = self.run_copy(success=False)
+        self.assertIn('reserved ".part" sibling', result.stderr)
+        self.assertFalse((self.dest / 'model.bin').exists())
 
     def test_checksum_failure_does_not_publish(self):
         (self.source / 'file').write_bytes(b'correct')

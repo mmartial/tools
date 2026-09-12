@@ -41,10 +41,7 @@ class TransferTests(unittest.TestCase):
                 'nc': 'echo "Unexpected netcat invocation" >&2; exit 99',
                 'ssh': '''exec python3 - "$@" <<'MOCK'
 import os, subprocess, sys
-args = sys.argv[1:]
-if args[0] in ('-n', '-q'):
-    args.pop(0)
-command = args[1]
+command = sys.argv[-1]
 command = command.replace('stream.write(data)', 'stream.write(data); open(os.environ["TEST_ROOT"] + "/transferred", "ab").write(data)')
 failure = os.environ['FAILURE']
 if failure == 'receiver':
@@ -53,7 +50,7 @@ if failure == 'checksum':
     command = command.replace('stream.write(data)', 'stream.write(bytes([data[0] ^ 1]) + data[1:])')
 if failure == 'retry':
     command = command.replace('listener.bind(("", port))', 'listener.bind(("192.0.2.1" if attempt == 0 else "", port))')
-command = command.replace('print(port, flush=True)', 'print(port, flush=True); open(os.environ["TEST_ROOT"] + "/ports", "a").write(str(port) + chr(10))')
+command = command.replace('print(port, token, flush=True)', 'print(port, token, flush=True); open(os.environ["TEST_ROOT"] + "/ports", "a").write(str(port) + chr(10))')
 if command.startswith("python3 "):
     os.execl("/bin/sh", "sh", "-c", "exec " + command)
 sys.exit(subprocess.call(command, shell=True))

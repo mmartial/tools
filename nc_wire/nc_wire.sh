@@ -131,6 +131,7 @@ import shutil
 
 BLOCK = 1024 * 1024
 BATCH = 128
+CHUNK = 64 * 1024 * 1024
 STATE = '.nc-wire-state'
 USE_SHA256SUM = False
 
@@ -215,6 +216,24 @@ def digest(path):
     return h.hexdigest()
 
 
+def chunk_hashes(path, size):
+    """Hash a partial file in CHUNK-sized pieces, for cheap prefix matching on retry."""
+    chunks = []
+    with open(path, 'rb') as stream:
+        remaining = min(os.fstat(stream.fileno()).st_size, size)
+        while remaining:
+            length = min(CHUNK, remaining)
+            # Only reuse a short last chunk if it reaches the source EOF.
+            if length < CHUNK and stream.tell() + length != size:
+                break
+            data = stream.read(length)
+            if len(data) != length:
+                break
+            chunks.append([length, hashlib.sha256(data).hexdigest()])
+            remaining -= length
+    return chunks
+
+
 def signature(info):
     return info.st_dev, info.st_ino, info.st_size, info.st_mtime_ns, info.st_ctime_ns
 
@@ -245,6 +264,11 @@ def entries(root):
     for folder, dirs, files in os.walk(root, followlinks=False, onerror=failed):
         dirs.sort()
         files.sort()
+        names = set(files)
+        for name in files:
+            if name + '.part' in names:
+                raise RuntimeError('Source contains a reserved ".part" sibling pair: ' +
+                                    os.path.join(folder, name))
         # Announce a directory only on entering it, not while listing siblings.
         if folder != root:
             yield {'path': os.path.relpath(folder, root), 'kind': 'dir'}
@@ -432,12 +456,6 @@ def server(root, port, force, skip_verify, sync):
     lock = os.open(os.path.join(state, 'lock'), os.O_CREAT | os.O_RDWR | os.O_NOFOLLOW, 0o600)
     with os.fdopen(lock, 'r+b') as lockfile:
         fcntl.flock(lockfile, fcntl.LOCK_EX | fcntl.LOCK_NB)
-        incoming = os.path.join(state, 'incoming')
-        if os.path.lexists(incoming) and not stat.S_ISREG(os.lstat(incoming).st_mode):
-            raise RuntimeError('Unsafe incoming temporary file')
-        # An interrupted file is retransmitted; completed files are hash-checked.
-        if os.path.exists(incoming):
-            os.unlink(incoming)
         token = os.urandom(32).hex()
         with socket.socket() as listener:
             listener.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
@@ -490,10 +508,13 @@ def server(root, port, force, skip_verify, sync):
                                 expected.add((entry['path'], entry['kind']))
                             path = checked_path(root, entry['path'], entry['kind'] == 'dir', create=False)
                             paths.append(path)
+                            part = path + '.part'
                             if entry['kind'] == 'dir':
                                 status.append(None)
                             elif os.path.exists(path):
                                 status.append({'size': os.stat(path).st_size} if skip_verify else {'sha256': digest(path)})
+                            elif not skip_verify and os.path.lexists(part) and stat.S_ISREG(os.lstat(part).st_mode):
+                                status.append({'chunks': chunk_hashes(part, entry['size'])})
                             else:
                                 status.append({})
                         send(stream, status)
@@ -507,14 +528,44 @@ def server(root, port, force, skip_verify, sync):
                             if action['action'] in ('skip', 'refuse'):
                                 had_refusal = had_refusal or action['action'] == 'refuse'
                                 continue
-                            if action['action'] != 'write' or (old and not force):
+                            resumable = bool(old) and 'chunks' in old
+                            if action['action'] == 'resume' and not resumable:
+                                raise RuntimeError('Resume not offered for: ' + entry['path'])
+                            if action['action'] not in ('write', 'resume') or (old and not resumable and not force):
                                 raise RuntimeError('Overwrite not authorized')
                             checked_path(root, entry['path'])
                             remaining = entry['size']
                             if not isinstance(remaining, int) or remaining < 0:
                                 raise RuntimeError('Invalid file size')
+                            part = path + '.part'
                             h = hashlib.sha256()
-                            with open(incoming, 'xb') as target:
+                            if action['action'] == 'resume':
+                                offset = action.get('offset')
+                                if not isinstance(offset, int) or offset <= 0 or offset > remaining:
+                                    raise RuntimeError('Invalid resume offset: ' + entry['path'])
+                                if not os.path.lexists(part) or not stat.S_ISREG(os.lstat(part).st_mode):
+                                    raise RuntimeError('No resumable partial file: ' + entry['path'])
+                                target = open(part, 'r+b')
+                                if os.fstat(target.fileno()).st_size < offset:
+                                    target.close()
+                                    raise RuntimeError('Partial file shorter than requested resume offset: ' + entry['path'])
+                                target.truncate(offset)
+                                target.seek(0)
+                                remaining_prefix = offset
+                                while remaining_prefix:
+                                    chunk = target.read(min(BLOCK, remaining_prefix))
+                                    if not chunk:
+                                        raise RuntimeError('Partial file shorter than requested resume offset: ' + entry['path'])
+                                    h.update(chunk)
+                                    remaining_prefix -= len(chunk)
+                                remaining -= offset
+                            else:
+                                if os.path.lexists(part):
+                                    if not stat.S_ISREG(os.lstat(part).st_mode):
+                                        raise RuntimeError('Unsafe partial file: ' + entry['path'])
+                                    os.unlink(part)
+                                target = open(part, 'xb')
+                            with target:
                                 while remaining:
                                     data = stream.read_frame(b'D')
                                     if not data or len(data) > min(BLOCK, remaining):
@@ -525,14 +576,14 @@ def server(root, port, force, skip_verify, sync):
                             trailer = receive(stream)
                             if trailer != {'sha256': h.hexdigest()}:
                                 raise RuntimeError('Checksum mismatch: ' + entry['path'])
-                            os.utime(incoming, ns=(entry['mtime_ns'], entry['mtime_ns']))
+                            os.utime(part, ns=(entry['mtime_ns'], entry['mtime_ns']))
                             # Recheck parent types before publishing. No concurrent writers supported.
                             checked_path(root, entry['path'])
                             if force:
-                                os.replace(incoming, path)
+                                os.replace(part, path)
                             else:
-                                os.link(incoming, path)
-                                os.unlink(incoming)
+                                os.link(part, path)
+                                os.unlink(part)
                         send(stream, {'ok': True})
 
 
@@ -762,20 +813,22 @@ def client(code, source, root, host, ip, port, force, verbose, color, skip_verif
                             send(stream, {'action': 'mkdir'}, flush=False)
                             batch_folders += 1
                             continue
-                        progress.current = (('Checking size' if skip_verify == 'true' else 'Verifying') if old else 'Preparing', entry['path'], 0, entry['size'])
+                        resuming = bool(old) and 'chunks' in old
+                        existing = bool(old) and not resuming
+                        progress.current = (('Checking size' if skip_verify == 'true' else 'Verifying') if existing else 'Preparing', entry['path'], 0, entry['size'])
                         path = os.path.join(source, entry['path'])
                         if signature(os.stat(path, follow_symlinks=False)) != tuple(entry['signature']):
                             raise RuntimeError('Source changed: ' + path)
-                        local_hash = digest(path) if old and skip_verify != 'true' else None
-                        if old and signature(os.stat(path, follow_symlinks=False)) != tuple(entry['signature']):
+                        local_hash = digest(path) if existing and skip_verify != 'true' else None
+                        if existing and signature(os.stat(path, follow_symlinks=False)) != tuple(entry['signature']):
                             raise RuntimeError('Source changed while hashing: ' + path)
-                        if old and (old['size'] == entry['size'] if skip_verify == 'true' else local_hash == old['sha256']):
+                        if existing and (old['size'] == entry['size'] if skip_verify == 'true' else local_hash == old['sha256']):
                             send(stream, {'action': 'skip'}, flush=False)
                             progress.skipped += 1
                             if hide_skipped != 'true':
                                 progress.record('Skipped (%s): %s' % (progress.skip_label, ascii(entry['path'])), '32')
                             continue
-                        if old and force != 'true':
+                        if existing and force != 'true':
                             send(stream, {'action': 'refuse'}, flush=False)
                             progress.refused += 1
                             message = 'nc_wire: Refusing differing file (use -f): ' + ascii(entry['path'])
@@ -784,13 +837,32 @@ def client(code, source, root, host, ip, port, force, verbose, color, skip_verif
                             else:
                                 print(progress.paint(message, '33'), file=sys.stderr)
                             continue
+                        offset = 0
+                        if resuming:
+                            with open(path, 'rb') as probe:
+                                for length, expected_hash in old['chunks']:
+                                    chunk = probe.read(length)
+                                    if len(chunk) != length or hashlib.sha256(chunk).hexdigest() != expected_hash:
+                                        break
+                                    offset += length
                         with open(path, 'rb') as source_file:
                             if signature(os.fstat(source_file.fileno())) != tuple(entry['signature']):
                                 raise RuntimeError('Source changed: ' + path)
-                            send(stream, {'action': 'write'}, flush=False)
                             h = hashlib.sha256()
-                            remaining = entry['size']
+                            if offset:
+                                remaining = offset
+                                while remaining:
+                                    data = source_file.read(min(BLOCK, remaining))
+                                    if not data:
+                                        raise RuntimeError('Source shortened: ' + path)
+                                    h.update(data)
+                                    remaining -= len(data)
+                                send(stream, {'action': 'resume', 'offset': offset}, flush=False)
+                            else:
+                                send(stream, {'action': 'write'}, flush=False)
+                            remaining = entry['size'] - offset
                             progress.start_file(entry['path'], entry['size'])
+                            progress.advance_file(entry['path'], offset, entry['size'])
                             while remaining:
                                 data = source_file.read(min(BLOCK, remaining))
                                 if not data:
@@ -904,6 +976,26 @@ fi
 is_installed ssh
 is_installed python3
 
+RECEIVER_PID=""
+READY_FILE=""
+SSH_CONTROL_PATH=$(mktemp -u /tmp/nc_wire-ssh.XXXXXX) || error_exit "nc_wire: Cannot allocate SSH control socket path."
+# Reuse one multiplexed SSH connection for every per-file control call instead of
+# paying a fresh handshake each time (prepare/receive/finish run once per file).
+ssh() { command ssh -o ControlMaster=auto -o ControlPath="$SSH_CONTROL_PATH" -o ControlPersist=60s "$@"; }
+cleanup_receiver() {
+    if [ -n "$RECEIVER_PID" ]; then
+        kill "$RECEIVER_PID" 2>/dev/null || true
+        wait "$RECEIVER_PID" 2>/dev/null || true
+    fi
+    [ -z "$READY_FILE" ] || rm -f "$READY_FILE"
+    if [ -S "$SSH_CONTROL_PATH" ]; then
+        command ssh -o ControlPath="$SSH_CONTROL_PATH" -O exit "$DEST_SSH" >/dev/null 2>&1 || true
+    fi
+}
+trap cleanup_receiver EXIT
+trap 'exit 130' INT
+trap 'exit 143' TERM
+
 # Validate every input before starting any transfer. Duplicate basenames would
 # overwrite each other in the shared destination folder.
 NAMES=()
@@ -919,9 +1011,10 @@ done
 send_file() {
     python3 -c '
 import socket, sys, time
-source = open(sys.argv[3], "rb") if len(sys.argv) > 3 else sys.stdin.buffer
-offset = int(sys.argv[4]) if len(sys.argv) > 4 else 0
-total = int(sys.argv[5]) if len(sys.argv) > 5 else None
+token = sys.argv[3].encode("ascii")
+source = open(sys.argv[4], "rb") if len(sys.argv) > 4 else sys.stdin.buffer
+offset = int(sys.argv[5]) if len(sys.argv) > 5 else 0
+total = int(sys.argv[6]) if len(sys.argv) > 6 else None
 if offset:
     source.seek(offset)
 sent = 0
@@ -938,6 +1031,7 @@ def progress(final=False):
 try:
     with socket.create_connection((sys.argv[1], int(sys.argv[2])), timeout=30) as sock:
         sock.settimeout(None)
+        sock.sendall(token)
         progress()
         while True:
             data = source.read(min(1024 * 1024, total - offset - sent) if total is not None else 1024 * 1024)
@@ -961,7 +1055,7 @@ finally:
     progress(final=True)
     if source is not sys.stdin.buffer:
         source.close()
-' "$DEST_IP" "$DEST_PORT" "$@"
+' "$DEST_IP" "$DEST_PORT" "$DEST_TOKEN" "$@"
 }
 
 # Pre-flight checks
@@ -971,19 +1065,6 @@ if ! ssh -q "$DEST_SSH" exit; then error_exit "nc_wire: Error: Cannot connect to
 vprint "nc_wire: Checking destination folder on remote..."
 REMOTE_FOLDER=$(shell_quote "$DEST_FOLDER")
 if ! ssh -n "$DEST_SSH" "test -d $REMOTE_FOLDER && test -w $REMOTE_FOLDER"; then error_exit "nc_wire: Error: Destination folder \"$DEST_FOLDER\" does not exist or is not writable on $DEST_SSH"; fi
-
-RECEIVER_PID=""
-READY_FILE=""
-cleanup_receiver() {
-    if [ -n "$RECEIVER_PID" ]; then
-        kill "$RECEIVER_PID" 2>/dev/null || true
-        wait "$RECEIVER_PID" 2>/dev/null || true
-    fi
-    [ -z "$READY_FILE" ] || rm -f "$READY_FILE"
-}
-trap cleanup_receiver EXIT
-trap 'exit 130' INT
-trap 'exit 143' TERM
 
 # Embedded so the installed command remains a single file. Both hosts need Python 3.
 REMOTE_HELPER=$(cat <<'PY'
@@ -1063,6 +1144,7 @@ try:
             stream.seek(offset)
             if sys.argv[4] != "complete":
                 requested = int(sys.argv[4]) if sys.argv[4] else None
+                token = os.urandom(32).hex()
                 with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as listener:
                     listener.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
                     for attempt in range(100):
@@ -1075,9 +1157,20 @@ try:
                                 raise
                     listener.listen(1)
                     listener.settimeout(30)
-                    print(port, flush=True)
+                    print(port, token, flush=True)
                     connection, _ = listener.accept()
                     with connection:
+                        connection.settimeout(30)
+                        expected_token = token.encode("ascii")
+                        received_token = b""
+                        while len(received_token) < len(expected_token):
+                            chunk = connection.recv(len(expected_token) - len(received_token))
+                            if not chunk:
+                                raise RuntimeError("Connection closed before authentication")
+                            received_token += chunk
+                        if received_token != expected_token:
+                            raise RuntimeError("Invalid transfer token")
+                        connection.settimeout(None)
                         while True:
                             data = connection.recv(1024 * 1024)
                             if not data:
@@ -1183,11 +1276,13 @@ else:
             kill -0 "$RECEIVER_PID" 2>/dev/null || break
             sleep 0.1
         done
-        read -r DEST_PORT < "$READY_FILE"
+        read -r DEST_PORT DEST_TOKEN < "$READY_FILE"
         rm -f "$READY_FILE"
         READY_FILE=""
         case "$DEST_PORT" in ''|*[!0-9]*) error_exit "nc_wire: Receiver failed to become ready." ;; esac
         [ "${#DEST_PORT}" -le 5 ] && [ "$DEST_PORT" -ge 1 ] && [ "$DEST_PORT" -le 65535 ] || error_exit "nc_wire: Invalid port returned by remote host."
+        case "$DEST_TOKEN" in ''|*[!0-9a-f]*) error_exit "nc_wire: Receiver did not return a valid transfer token." ;; esac
+        [ "${#DEST_TOKEN}" -eq 64 ] || error_exit "nc_wire: Receiver did not return a valid transfer token."
         vprint "nc_wire: Receiver ready on port $DEST_PORT"
         if ! send_file "$IN_FILE" "$RESUME" "$SRC_SIZE"; then
             error_exit "nc_wire: Sender failed; .part retained for retry."

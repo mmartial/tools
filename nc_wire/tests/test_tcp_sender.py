@@ -14,6 +14,7 @@ class SenderTest(unittest.TestCase):
     def test_slow_receiver_gets_entire_file(self):
         source = SCRIPT.read_text()
         function = source[source.index('send_file() {'):source.index('# Pre-flight checks')]
+        token = 'ab' * 32
         payload = bytes(range(256)) * 65536
         received = bytearray()
         errors = []
@@ -40,16 +41,17 @@ class SenderTest(unittest.TestCase):
             worker.start()
             result = subprocess.run(
                 ['bash', '-c', function + '\n'
-                 'DEST_IP=127.0.0.1\nDEST_PORT=$1\nsend_file', 'test',
-                 str(listener.getsockname()[1])],
+                 'DEST_IP=127.0.0.1\nDEST_PORT=$1\nDEST_TOKEN=$2\nsend_file', 'test',
+                 str(listener.getsockname()[1]), token],
                 input=payload, capture_output=True, timeout=30,
             )
             worker.join(20)
         self.assertFalse(worker.is_alive())
         self.assertEqual(errors, [])
         self.assertEqual(result.returncode, 0, result.stderr)
-        self.assertEqual(len(received), len(payload))
-        self.assertEqual(hashlib.sha256(received).digest(), hashlib.sha256(payload).digest())
+        self.assertEqual(bytes(received[:len(token)]), token.encode('ascii'))
+        self.assertEqual(len(received) - len(token), len(payload))
+        self.assertEqual(hashlib.sha256(bytes(received[len(token):])).digest(), hashlib.sha256(payload).digest())
 
 
 if __name__ == '__main__':
