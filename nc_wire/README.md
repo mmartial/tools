@@ -18,9 +18,9 @@ nc_wire [-v] [-f] [-p <port>] -i <ip> -s <ssh> -d <folder> [--] <file> [file ...
 ```
 
 ```bash
-nc_wire -i 10.0.0.13 -s motoko \
-  -d "/4TB/StabilityMatrix/Data/Models/DiffusionModels/Flux.1 D/" \
-  ~/Downloads/reiq*.safetensors "$HOME/Downloads/another model.safetensors"
+nc_wire -i 10.11.22.13 -s host \
+  -d "/StabilityMatrix/Data/Models/DiffusionModels/Flux.1 D/" \
+  ~/Downloads/modelname*.safetensors "$HOME/Downloads/another modelname.safetensors"
 ```
 
 Use actual paths for quoted filenames; tilde expansion works only when the tilde is unquoted. For example, `"$HOME/Downloads/my model.safetensors"`.
@@ -36,7 +36,7 @@ To use a firewall-approved port, add `-p 16432`. Valid ports are 1–65535. The 
 ## Directory copying
 
 ```bash
-nc_wire -r -i 10.0.0.15 -s user@nas -d /volume1/backup /local/source
+nc_wire -r -i 10.11.12.15 -s user@nas -d /volume1/backup /local/source
 ```
 
 `-r` (or `--recursive`) accepts exactly one source directory. It copies the **contents** into the existing destination: `/local/source/path/file` becomes `/volume1/backup/path/file`. A trailing slash on the source does not change this mapping. Directories are created as their turn in the sequential transfer is reached, immediately before their contents are processed; inspecting a manifest batch does not create future folders. Empty directories are still preserved; extra destination files are left untouched. Hidden files are included.
@@ -48,7 +48,7 @@ Directory mode uses one SSH session to start a persistent Python receiver and on
 Add `--color` to enable colored progress and status output, for example:
 
 ```bash
-nc_wire -r -v --color -i 10.0.0.15 -s user@nas -d /volume1/backup /local/source
+nc_wire -r -v --color -i 10.11.12.15 -s user@nas -d /volume1/backup /local/source
 ```
 
 Green highlights copy counts and successful completion, cyan highlights the current operation and verbose status, and yellow highlights refusals or pending confirmation. Colors are off by default and disabled for redirected output, `TERM=dumb`, or when `NO_COLOR` is set. Individual-file mode also colors its verbose status messages. Colors never enter the transfer protocol.
@@ -68,7 +68,7 @@ Writes are buffered by the operating system; directory mode does not force a dis
 Add `--skip-verify` in directory mode to skip existing files whose byte size matches the source, without reading and hashing their contents on either host:
 
 ```bash
-nc_wire -r -v --color --skip-verify -i 10.0.0.15 -s user@nas -d /volume1/backup /local/source
+nc_wire -r -v --color --skip-verify -i 10.11.12.15 -s user@nas -d /volume1/backup /local/source
 ```
 
 The display labels these files `size-matched/skipped`. Missing files are copied; size mismatches are reported and require `-f` to replace, as with normal directory copying. Newly transferred files still get streaming SHA256 verification before publication. An incomplete temporary file is retransmitted as usual.
