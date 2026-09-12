@@ -1,6 +1,6 @@
 # nc_wire
 
-Build as a way to do some simple "rsync"-like copies (is not designed as a replacement for the more feature complete rsync, but simplifies some as-fast-as-the-wire will allow copies to run a remote copy without the need to configure an rsync server)
+Build as a way to do some simple "rsync"-like copies (is not designed as a replacement for the more feature complete rsync, but simplifies some as-fast-as-the-wire [does not encrypt the data copied over] will allow copies to run a remote copy without the need to configure an rsync server)
 
 Copy files or a directory tree sequentially to a remote folder using SSH for control and Python TCP sockets for data transfer.
 
